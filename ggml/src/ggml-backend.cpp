@@ -1167,6 +1167,16 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// GGML_SCHED_TIMING: one record per split of the serial compute loop (diagnostic)
+struct ggml_sched_timing_rec {
+    int split, backend, n_nodes, n_inputs;
+    bool h2d;            // split streams host expert weights (prefetched or copied on the compute stream)
+    size_t h2d_bytes;
+    int64_t host_pre_us, host_eval_us, host_post_us;
+    ggml_backend_event_t ev[3];   // before the copy wait, after copy_inputs, after the eval submit
+    float gpu_wait_ms, gpu_comp_ms;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1232,6 +1242,16 @@ struct ggml_backend_sched {
     bool has_reduce = false;
 
     // H2D expert prefetch: streamed host expert weights are copied ahead on a transfer stream into private slots
+    // GGML_SCHED_TIMING (diagnostic): per-split timeline of the serial compute loop
+    int timing = 0;
+    bool timing_pending = false;
+    int64_t timing_t0_us = 0, timing_t1_us = 0;
+    std::vector<ggml_sched_timing_rec> timing_recs;
+    std::vector<ggml_backend_event_t> timing_ev_pool[GGML_SCHED_MAX_BACKENDS];
+    size_t timing_ev_used[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_event_t timing_ev_start[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_event_t timing_ev_end[GGML_SCHED_MAX_BACKENDS];
+
     int h2d_n_sets = 0;
     struct h2d_slot {
         ggml_backend_buffer_t buf = nullptr;
@@ -2496,6 +2516,94 @@ static void ggml_sched_h2d_done(ggml_backend_sched_t sched, struct ggml_backend_
     ggml_sched_h2d_fill_backend(sched, b);
 }
 
+// ---- GGML_SCHED_TIMING: per-split timeline of the serial loop (diagnostic) --------------------------------------
+static bool ggml_sched_timing_backend_ok(ggml_backend_sched_t sched, int b) {
+    ggml_backend_t be = sched->backends[b];
+    return sched->timing > 0 && be->iface.event_new && be->iface.event_record && be->iface.event_elapsed_ms;
+}
+
+static ggml_backend_event_t ggml_sched_timing_event(ggml_backend_sched_t sched, int b) {
+    auto & pool = sched->timing_ev_pool[b];
+    size_t & used = sched->timing_ev_used[b];
+    if (used == pool.size()) {
+        pool.push_back(ggml_backend_event_new(sched->backends[b]));
+    }
+    return pool[used++];
+}
+
+static void ggml_sched_timing_report(ggml_backend_sched_t sched) {
+    if (!sched->timing_pending) return;
+    sched->timing_pending = false;
+    const int64_t t_sync = ggml_time_us();
+    const double wall_ms = (t_sync - sched->timing_t0_us) / 1000.0;
+    const double loop_ms = (sched->timing_t1_us - sched->timing_t0_us) / 1000.0;
+    double pre = 0, ev = 0, ev_cpu = 0, post = 0, gwait = 0, gcomp = 0, gcomp_h2d = 0, gcomp_other = 0;
+    size_t bytes = 0;
+    int n_h2d = 0, n_cpu = 0;
+    for (auto & r : sched->timing_recs) {
+        pre += r.host_pre_us; ev += r.host_eval_us; post += r.host_post_us;
+        if (ggml_backend_is_cpu(sched->backends[r.backend])) { ev_cpu += r.host_eval_us; n_cpu++; }
+        r.gpu_wait_ms = r.gpu_comp_ms = 0.0f;
+        if (r.ev[0] && r.ev[1] && r.ev[2]) {
+            ggml_backend_t be = sched->backends[r.backend];
+            const float w = be->iface.event_elapsed_ms(r.ev[0], r.ev[1]);
+            const float c = be->iface.event_elapsed_ms(r.ev[1], r.ev[2]);
+            if (w > 0) { r.gpu_wait_ms = w; gwait += w; }
+            if (c > 0) { r.gpu_comp_ms = c; gcomp += c; if (r.h2d) gcomp_h2d += c; else gcomp_other += c; }
+        }
+        if (r.h2d) { n_h2d++; bytes += r.h2d_bytes; }
+    }
+    double span = 0;
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (sched->timing_ev_start[b] && sched->timing_ev_end[b]) {
+            const float s = sched->backends[b]->iface.event_elapsed_ms(sched->timing_ev_start[b], sched->timing_ev_end[b]);
+            if (s > span) span = s;
+        }
+    }
+    if (wall_ms < 20.0 && sched->timing < 2) return; // skip small (decode) graphs
+    fprintf(stderr, "[sched-timing] %d splits (%d cpu, %d h2d, %.2f GB streamed) wall %.1f ms | host: loop %.1f (pre %.1f, eval %.1f [cpu %.1f], post %.1f) final-sync %.1f | gpu: span %.1f, wait-on-copy %.1f, compute %.1f (h2d %.1f, other %.1f), idle %.1f\n",
+            (int)sched->timing_recs.size(), n_cpu, n_h2d, bytes / 1e9, wall_ms,
+            loop_ms, pre / 1000.0, ev / 1000.0, ev_cpu / 1000.0, post / 1000.0, (t_sync - sched->timing_t1_us) / 1000.0,
+            span, gwait, gcomp, gcomp_h2d, gcomp_other, span > 0 ? span - gwait - gcomp : 0.0);
+    if (sched->timing >= 2) {
+        for (auto & r : sched->timing_recs) {
+            fprintf(stderr, "[sched-timing]  #%4d b%d nodes %4d in %2d h2d %6.0f MB | host pre %8.2f eval %8.2f post %7.2f ms | gpu wait %8.2f comp %8.2f ms\n",
+                    r.split, r.backend, r.n_nodes, r.n_inputs, r.h2d_bytes / 1e6,
+                    r.host_pre_us / 1000.0, r.host_eval_us / 1000.0, r.host_post_us / 1000.0, r.gpu_wait_ms, r.gpu_comp_ms);
+        }
+    }
+    fflush(stderr);
+}
+
+static void ggml_sched_timing_begin(ggml_backend_sched_t sched) {
+    if (sched->timing <= 0) return;
+    if (sched->timing_pending) {
+        ggml_backend_sched_synchronize(sched); // reports the previous eval
+    }
+    sched->timing_recs.clear();
+    for (int b = 0; b < sched->n_backends; ++b) {
+        sched->timing_ev_used[b] = 0;
+        sched->timing_ev_start[b] = sched->timing_ev_end[b] = nullptr;
+        if (ggml_sched_timing_backend_ok(sched, b)) {
+            sched->timing_ev_start[b] = ggml_sched_timing_event(sched, b);
+            ggml_backend_event_record(sched->timing_ev_start[b]);
+        }
+    }
+    sched->timing_t0_us = ggml_time_us();
+}
+
+static void ggml_sched_timing_end(ggml_backend_sched_t sched) {
+    if (sched->timing <= 0) return;
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (sched->timing_ev_start[b]) {
+            sched->timing_ev_end[b] = ggml_sched_timing_event(sched, b);
+            ggml_backend_event_record(sched->timing_ev_end[b]);
+        }
+    }
+    sched->timing_t1_us = ggml_time_us();
+    sched->timing_pending = true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
 
     for (auto & item : sched->needs_sync) item = true;
@@ -2784,6 +2892,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t moe_next  = 0; // first moe_infos entry with split >= current split
     size_t moe_enq   = 0; // moe_infos entries already enqueued for lookahead
 
+    ggml_sched_timing_begin(sched);
     ggml_sched_h2d_begin(sched);
 
     for (int i = 0; i < sched->n_splits; i++) {
@@ -2793,6 +2902,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[i];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        ggml_sched_timing_rec trec{};
+        const bool t_on  = sched->timing > 0;
+        const bool t_gpu = t_on && ggml_sched_timing_backend_ok(sched, split_backend_id);
+        int64_t t_mark = 0;
+        if (t_on) {
+            trec.split = i; trec.backend = split_backend_id; trec.n_nodes = split->graph.n_nodes; trec.n_inputs = split->n_inputs;
+            for (int j = 0; j < split->n_inputs; ++j) {
+                if (ggml_sched_h2d_streamed_input(split->inputs[j])) { trec.h2d = true; trec.h2d_bytes += ggml_nbytes(split->inputs[j]); }
+            }
+            if (t_gpu) { trec.ev[0] = ggml_sched_timing_event(sched, split_backend_id); ggml_backend_event_record(trec.ev[0]); }
+            t_mark = ggml_time_us();
+        }
 
         if (moe_prefetch && !moe_infos.empty()) {
             while (moe_next < moe_infos.size() && moe_infos[moe_next].split < i) {
@@ -2815,6 +2937,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+        if (t_on) {
+            const int64_t t = ggml_time_us(); trec.host_pre_us = t - t_mark; t_mark = t;
+            if (t_gpu) { trec.ev[1] = ggml_sched_timing_event(sched, split_backend_id); ggml_backend_event_record(trec.ev[1]); }
+        }
 
         // ids are now final and host-visible; enqueue the selected expert
         // slices of this split's host-computed MoE matmuls (up/gate and down
@@ -2839,7 +2965,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
         }
+        if (t_on) {
+            const int64_t t = ggml_time_us(); trec.host_eval_us = t - t_mark; t_mark = t;
+            if (t_gpu) { trec.ev[2] = ggml_sched_timing_event(sched, split_backend_id); ggml_backend_event_record(trec.ev[2]); }
+        }
         ggml_sched_h2d_done(sched, split);
+        if (t_on) { trec.host_post_us = ggml_time_us() - t_mark; sched->timing_recs.push_back(trec); }
 
         // the pages the lookahead streamer just read for this split are one-shot
         // streaming traffic; MADV_COLD them so the decode working set survives
@@ -2858,6 +2989,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    ggml_sched_timing_end(sched);
     sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
 
     return GGML_STATUS_SUCCESS;
@@ -2878,6 +3010,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     for (int i = 0; i < (GGML_OP_COUNT + 31)/32; ++i) sched->op_offload[i] = 0xffffffff;
 
     sched->debug = getenv("GGML_SCHED_DEBUG") != NULL;
+    if (const char * env = getenv("GGML_SCHED_TIMING")) {
+        sched->timing = std::max(0, atoi(env));
+        if (sched->timing > 0) fprintf(stderr, "%s: scheduler split timing enabled (level %d)\n", __func__, sched->timing);
+    }
     if (const char * env = getenv("GGML_SCHED_H2D_PREFETCH")) {
         sched->h2d_n_sets = std::max(0, atoi(env)) > 1 ? atoi(env) : 0;
         if (sched->h2d_n_sets > 0) fprintf(stderr, "%s: H2D expert prefetch enabled with %d slot sets\n", __func__, sched->h2d_n_sets);
@@ -3109,6 +3245,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
     }
+    ggml_sched_timing_report(sched);
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

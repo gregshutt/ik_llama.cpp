@@ -131,6 +131,8 @@ extern "C" {
         void                 (*GGML_CALL set_tensor_async_xfer)(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
         void                 (*GGML_CALL event_record_xfer)   (ggml_backend_event_t event);
         void                 (*GGML_CALL event_wait_xfer)     (ggml_backend_t backend, ggml_backend_event_t event);
+        // (optional, diagnostic) GPU time in ms between two completed events created with timing enabled; < 0 on error
+        float                (*GGML_CALL event_elapsed_ms)    (ggml_backend_event_t a, ggml_backend_event_t b);
     };
 
     struct ggml_backend {

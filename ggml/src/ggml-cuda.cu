@@ -5427,6 +5427,22 @@ GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const
     GGML_UNUSED(backend);
 }
 
+// GGML_SCHED_TIMING: events carry timestamps so the scheduler can measure per-split GPU time
+static bool ggml_backend_cuda_events_timed() {
+    static const bool on = getenv("GGML_SCHED_TIMING") != nullptr;
+    return on;
+}
+
+static float ggml_backend_cuda_event_elapsed_ms(ggml_backend_event_t a, ggml_backend_event_t b) {
+    float ms = 0.0f;
+    cudaError_t err = cudaEventElapsedTime(&ms, (cudaEvent_t)a->context, (cudaEvent_t)b->context);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return -1.0f;
+    }
+    return ms;
+}
+
 static ggml_backend_event_t ggml_backend_cuda_event_new(ggml_backend_t backend) {
 #ifdef GGML_CUDA_NO_PEER_COPY
     return nullptr;
@@ -5436,7 +5452,7 @@ static ggml_backend_event_t ggml_backend_cuda_event_new(ggml_backend_t backend) 
     ggml_cuda_set_device(cuda_ctx->device);
 
     cudaEvent_t event;
-    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, ggml_backend_cuda_events_timed() ? cudaEventDefault : cudaEventDisableTiming));
 
     return new ggml_backend_event {
         /* .backend = */ backend,
@@ -5532,6 +5548,7 @@ static ggml_backend_i ggml_backend_cuda_interface = {
     /* .set_tensor_async_xfer   = */ ggml_backend_cuda_set_tensor_async_xfer,
     /* .event_record_xfer       = */ ggml_backend_cuda_event_record_xfer,
     /* .event_wait_xfer         = */ ggml_backend_cuda_event_wait_xfer,
+    /* .event_elapsed_ms        = */ ggml_backend_cuda_event_elapsed_ms,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
