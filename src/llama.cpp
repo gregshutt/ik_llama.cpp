@@ -7613,9 +7613,17 @@ static int llama_decode_internal(
             }
 
             if (can_check && any_diff && has_dup) {
-                n_tokens = 1;
+                // the recurrent layers take an ubatch that is one sequence (any length) or one token per sequence.
+                // A batch that mixes the tail of one slot's prompt with the head of the next one's (llama-server
+                // --parallel N) is cut at the sequence boundaries, one run of the same sequence per ubatch, instead
+                // of into single tokens (which cost one graph per token: 150 s for an 8192-token batch)
+                uint32_t run = 1;
+                while (run < n_tokens && batch_all.seq_id[cur_token + run][0] == first_seq_id) {
+                    ++run;
+                }
+                n_tokens = run;
                 if (!warned_qnext_mixed_repeat) {
-                    LLAMA_LOG_WARN("%s: qwen3next mixed-sequence batch contains repeated seq_id values; falling back to single-token chunking\n", __func__);
+                    LLAMA_LOG_WARN("%s: mixed-sequence batch with repeated seq_id values: chunked at the sequence boundaries\n", __func__);
                     warned_qnext_mixed_repeat = true;
                 }
             }
