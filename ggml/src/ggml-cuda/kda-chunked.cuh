@@ -658,13 +658,16 @@ static inline void launch(
         size_t gnb0, size_t gnb1, size_t gnb2, size_t gnb3,
         size_t bnb1, size_t bnb2, size_t bnb3,
         cudaStream_t stream) {
-    static bool attr_done = false;
-    if (!attr_done) {
+    // function attributes are per device: a layer-split run launches these kernels on every GPU
+    static bool attr_done[GGML_CUDA_MAX_DEVICES] = {};
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    if (!attr_done[dev]) {
         CUDA_CHECK(cudaFuncSetAttribute(kda_chunk_intra, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_INTRA));
         CUDA_CHECK(cudaFuncSetAttribute(kda_chunk_seq,   cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SEQ));
         CUDA_CHECK(cudaFuncSetAttribute(kda_chunk_intra, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
         CUDA_CHECK(cudaFuncSetAttribute(kda_chunk_seq,   cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-        attr_done = true;
+        attr_done[dev] = true;
     }
     const int n_heads_kq = n_heads / gqa_ratio;
     const int n_chunks = (n_tokens + C - 1) / C;
