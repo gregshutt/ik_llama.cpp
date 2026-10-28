@@ -270,6 +270,8 @@ struct llama_layer {
     llama_split_tensor split_ssm_alpha;
     llama_split_tensor split_ssm_f_a;
     llama_split_tensor split_ssm_g_a;
+    llama_split_tensor split_ssm_f_b;   // glm5next low-rank beta gate, second half
+    llama_split_tensor split_ssm_g_b;   // glm5next low-rank output gate, second half
     llama_split_tensor split_ssm_norm;
     llama_split_tensor split_ssm_out;
 

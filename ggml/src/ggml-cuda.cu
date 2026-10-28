@@ -47,6 +47,51 @@
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/graph.cuh"
 #include "ggml-cuda/mmq_id.cuh"
+#include <map>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <cctype>
+// GGML_CUDA_OP_TIMING=1: accumulate GPU time per op kind (tensor name with the layer index stripped), print at exit
+struct ggml_cuda_op_timing {
+    bool enabled = false;
+    std::vector<cudaEvent_t> events;
+    std::vector<std::pair<std::string, int>> pending;
+    std::map<std::string, std::pair<double, int64_t>> acc;
+    double total_ms = 0;
+    cudaEvent_t event(size_t k) {
+        while (events.size() <= k) { cudaEvent_t e; CUDA_CHECK(cudaEventCreate(&e)); events.push_back(e); }
+        return events[k];
+    }
+    static std::string key(const ggml_tensor * node) {
+        std::string n = node->name;
+        size_t p = n.find_last_of('-');
+        if (p != std::string::npos && p + 1 < n.size() && std::all_of(n.begin() + p + 1, n.end(), [](char c) { return std::isdigit((unsigned char)c) != 0; })) n.erase(p);
+        return std::string(ggml_op_name(node->op)) + " " + n;
+    }
+};
+static bool ggml_cuda_op_trace_enabled() { static const bool on = getenv("GGML_CUDA_OP_TRACE") != nullptr; return on; }
+static void ggml_cuda_op_timing_print();
+static ggml_cuda_op_timing & ggml_cuda_op_timing_get() {
+    static ggml_cuda_op_timing t;
+    static bool init = []() {
+        t.enabled = getenv("GGML_CUDA_OP_TIMING") != nullptr;
+        if (t.enabled) atexit(ggml_cuda_op_timing_print);
+        return true;
+    }();
+    (void)init;
+    return t;
+}
+static void ggml_cuda_op_timing_print() {
+    auto & t = ggml_cuda_op_timing_get();
+    std::vector<std::pair<std::string, std::pair<double, int64_t>>> v(t.acc.begin(), t.acc.end());
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+    fprintf(stderr, "\n==== GPU op timing: total %.1f ms over %zu op kinds ====\n", t.total_ms, v.size());
+    for (size_t i = 0; i < v.size() && i < 48; ++i) {
+        fprintf(stderr, "%10.1f ms %5.1f%% %8lld  %s\n", v[i].second.first, t.total_ms > 0 ? 100.0*v[i].second.first/t.total_ms : 0.0,
+                (long long)v[i].second.second, v[i].first.c_str());
+    }
+}
 #include "ggml-cuda/quantize_id.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/conv2d.cuh"
@@ -4779,16 +4824,35 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
 
+            auto & optiming = ggml_cuda_op_timing_get();
+            size_t nt = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 
                 if (ggml_is_noop(node)) continue;
 
+                if (optiming.enabled) { CUDA_CHECK(cudaEventRecord(optiming.event(2*nt), cuda_ctx->stream())); }
+                if (ggml_cuda_op_trace_enabled()) { fprintf(stderr, "[optrace] dev %d %s %s src0=%s(%s)\n", cuda_ctx->device, ggml_op_name(node->op), node->name, node->src[0] ? node->src[0]->name : "-", node->src[0] ? ggml_type_name(node->src[0]->type) : "-"); fflush(stderr); }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, cgraph, i);
                 if (!ok) {
                     GGML_CUDA_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (optiming.enabled) {
+                    CUDA_CHECK(cudaEventRecord(optiming.event(2*nt + 1), cuda_ctx->stream()));
+                    optiming.pending.push_back({ggml_cuda_op_timing::key(node), (int)nt});
+                    nt++;
+                }
+            }
+            if (optiming.enabled && nt > 0) {
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                for (auto & p : optiming.pending) {
+                    float ms = 0.0f;
+                    CUDA_CHECK(cudaEventElapsedTime(&ms, optiming.event(2*p.second), optiming.event(2*p.second + 1)));
+                    auto & a = optiming.acc[p.first];
+                    a.first += ms; a.second += 1; optiming.total_ms += ms;
+                }
+                optiming.pending.clear();
             }
         }
 #ifdef USE_CUDA_GRAPH
@@ -5416,6 +5480,34 @@ static void ggml_backend_cuda_event_synchronize(ggml_backend_event_t event) {
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
+// H2D expert prefetch: copies and events on a dedicated per-device transfer stream (last stream slot)
+static cudaStream_t ggml_backend_cuda_xfer_stream(ggml_backend_cuda_context * cuda_ctx) {
+    return cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_MAX_STREAMS - 1);
+}
+
+GGML_CALL static void ggml_backend_cuda_set_tensor_async_xfer(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, ggml_backend_cuda_xfer_stream(cuda_ctx)));
+}
+
+static void ggml_backend_cuda_event_record_xfer(ggml_backend_event_t event) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)event->backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, ggml_backend_cuda_xfer_stream(cuda_ctx)));
+}
+
+static void ggml_backend_cuda_event_wait_xfer(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    GGML_ASSERT(ggml_backend_is_cuda(event->backend));
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaStreamWaitEvent(ggml_backend_cuda_xfer_stream(cuda_ctx), (cudaEvent_t)event->context, 0));
+}
+
 static ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_name,
     /* .free                    = */ ggml_backend_cuda_free,
@@ -5437,6 +5529,9 @@ static ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .event_synchronize       = */ ggml_backend_cuda_event_synchronize,
+    /* .set_tensor_async_xfer   = */ ggml_backend_cuda_set_tensor_async_xfer,
+    /* .event_record_xfer       = */ ggml_backend_cuda_event_record_xfer,
+    /* .event_wait_xfer         = */ ggml_backend_cuda_event_wait_xfer,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

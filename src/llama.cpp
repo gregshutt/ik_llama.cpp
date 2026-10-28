@@ -1320,7 +1320,8 @@ static bool llama_kv_cache_init(
     }
 
     const bool is_dsv4_k_only = llm_arch_is_dsv4(model.arch);
-    bool is_mla_attn = model.is_mla_model();
+    bool is_mla_attn = model.is_mla_model() ||
+        (model.arch == LLM_ARCH_GLM5NEXT && (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN));
 
     bool split_cache   = false;
     bool replicate_mla = false;
@@ -4279,6 +4280,7 @@ static void ggml_backend_add_from_device(llama_context* ctx, ggml_backend_t back
 static bool is_model_split_supported(const llama_model & model) {
     static std::unordered_set<llm_arch> k_supported = {
         LLM_ARCH_LLAMA,
+        LLM_ARCH_GLM5NEXT,  // probe: KDA/FFN/MoE helpers are split-aware; MLA + hyper-connections under review
         LLM_ARCH_QWEN3MOE,
         LLM_ARCH_GLM4_MOE,
         LLM_ARCH_MISTRAL3,

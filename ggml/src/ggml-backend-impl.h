@@ -126,6 +126,11 @@ extern "C" {
         void                 (*GGML_CALL event_wait)        (ggml_backend_t backend, ggml_backend_event_t event);
         // block until an event is recorded
         void                 (*GGML_CALL event_synchronize) (ggml_backend_event_t event);
+
+        // (optional) host->device copy on a dedicated transfer stream, with events recorded on / waited by that stream
+        void                 (*GGML_CALL set_tensor_async_xfer)(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+        void                 (*GGML_CALL event_record_xfer)   (ggml_backend_event_t event);
+        void                 (*GGML_CALL event_wait_xfer)     (ggml_backend_t backend, ggml_backend_event_t event);
     };
 
     struct ggml_backend {

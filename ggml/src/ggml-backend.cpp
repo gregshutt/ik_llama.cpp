@@ -1161,6 +1161,8 @@ struct ggml_backend_sched_split {
     int i_end;
     struct ggml_tensor * inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_inputs;
+    int h2d_set;        // H2D prefetch slot set, -1 = none
+    uint64_t h2d_mask;  // inputs already copied by the H2D prefetcher
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -1228,6 +1230,26 @@ struct ggml_backend_sched {
     bool is_async = false;
     bool debug;
     bool has_reduce = false;
+
+    // H2D expert prefetch: streamed host expert weights are copied ahead on a transfer stream into private slots
+    int h2d_n_sets = 0;
+    struct h2d_slot {
+        ggml_backend_buffer_t buf = nullptr;
+        size_t size = 0;
+        ggml_backend_event_t ready = nullptr;   // recorded on the transfer stream after the copy
+        ggml_backend_event_t freed = nullptr;   // recorded on the compute stream after the consuming split
+        bool has_freed = false;
+    };
+    struct h2d_state {
+        int n_sets = 0;
+        int n_per_set = 0;
+        int in_flight = 0;
+        int cursor = 0;
+        bool disabled = false;
+        std::vector<size_t> sizes;   // [set*GGML_SCHED_H2D_MAX_POS + pos]
+        std::vector<h2d_slot> slots;
+    };
+    std::array<h2d_state, GGML_SCHED_MAX_BACKENDS> h2d;
 };
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
@@ -1250,6 +1272,11 @@ void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op 
 void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
     if (!sched) return;
     sched->only_active_experts = on_or_off;
+}
+
+void ggml_backend_sched_set_h2d_prefetch(ggml_backend_sched_t sched, int n_sets) {
+    if (!sched) return;
+    sched->h2d_n_sets = n_sets > 1 ? n_sets : 0;
 }
 
 void ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async) {
@@ -2002,7 +2029,10 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
     for (int i = 0; i < sched->n_splits; ++i) sched->splits[i].graph.uid = get_next_graph_uid();
 }
 
+static void ggml_sched_h2d_assign(ggml_backend_sched_t sched);
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    ggml_sched_h2d_assign(sched);
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -2050,6 +2080,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
     for (int pass_input = 0; pass_input < n_input_passes*split->n_inputs; ++pass_input) {
         const bool callback_copy_pass = pass_input >= split->n_inputs;
         const int j = pass_input % split->n_inputs;
+        if (sched->h2d_n_sets > 0 && (split->h2d_mask & (1ull << j))) continue; // already copied by the H2D prefetcher
         ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
         struct ggml_tensor * input = split->inputs[j];
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
@@ -2254,6 +2285,217 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
     return GGML_STATUS_SUCCESS;
 }
 
+// ---- H2D expert prefetch -----------------------------------------------------------------------------
+// Host-resident expert weights that the scheduler offloads to a GPU for large batches are normally copied on
+// the compute stream right before the split that uses them, so the PCIe link and the GPU take turns. With
+// GGML_SCHED_H2D_PREFETCH=N (N >= 2) each such copy targets a private slot and is issued on the backend's
+// transfer stream up to N splits ahead, fenced with events, so copies overlap the previous splits' compute.
+
+#define GGML_SCHED_H2D_MAX_POS 4
+
+static bool ggml_sched_h2d_streamed_input(const struct ggml_tensor * input) {
+    return input->ne[2] > 1 && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
+           ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+static void ggml_sched_h2d_free_backend(ggml_backend_sched_t sched, int b) {
+    auto & st = sched->h2d[b];
+    for (auto & slot : st.slots) {
+        if (slot.ready) ggml_backend_event_free(slot.ready);
+        if (slot.freed) ggml_backend_event_free(slot.freed);
+        if (slot.buf)   ggml_backend_buffer_free(slot.buf);
+    }
+    st.slots.clear();
+    st.n_sets = st.n_per_set = st.in_flight = st.cursor = 0;
+    st.sizes.clear();
+}
+
+// called after the graph is split, before allocation: give streamed expert copies their slot memory.
+// Sets are assigned round-robin in split order and each (set, position) slot is sized to the largest tensor
+// that ever lands there, so a layer whose up+gate split alternates with its down split costs one layer of VRAM.
+static void ggml_sched_h2d_assign(ggml_backend_sched_t sched) {
+    if (sched->h2d_n_sets <= 0) return;
+    for (int i = 0; i < sched->n_splits; i++) {
+        sched->splits[i].h2d_set = -1;
+        sched->splits[i].h2d_mask = 0;
+    }
+
+    const int n_sets = sched->h2d_n_sets;
+    const size_t n_slots = (size_t)n_sets * GGML_SCHED_H2D_MAX_POS;
+    std::array<int, GGML_SCHED_MAX_BACKENDS> n_per_set{};
+    std::array<int, GGML_SCHED_MAX_BACKENDS> rr{};
+    std::array<std::vector<size_t>, GGML_SCHED_MAX_BACKENDS> max_size;
+    for (int i = 0; i < sched->n_splits; i++) {
+        auto * split = &sched->splits[i];
+        const int b = split->backend_id;
+        ggml_backend_t backend = sched->backends[b];
+        if (ggml_backend_is_cpu(backend) || sched->h2d[b].disabled || !backend->iface.set_tensor_async_xfer ||
+            !backend->iface.event_record_xfer || !backend->iface.event_wait_xfer || !backend->iface.event_new) {
+            continue;
+        }
+        size_t sz[GGML_SCHED_H2D_MAX_POS] = {0};
+        int pos = 0;
+        for (int j = 0; j < split->n_inputs; ++j) {
+            if (!ggml_sched_h2d_streamed_input(split->inputs[j])) continue;
+            if (pos == GGML_SCHED_H2D_MAX_POS) { pos = -1; break; }
+            struct ggml_tensor * cpy = tensor_copy(split->inputs[j], b, sched->cur_copy);
+            size_t s = ggml_backend_buft_get_alloc_size(sched->bufts[b], cpy);
+            sz[pos++] = 256*((s + 255)/256);
+        }
+        if (pos <= 0) continue;
+        if (max_size[b].empty()) max_size[b].assign(n_slots, 0);
+        const int s = rr[b] % n_sets;
+        rr[b]++;
+        split->h2d_set = s;
+        n_per_set[b] = std::max(n_per_set[b], pos);
+        for (int p = 0; p < pos; ++p) {
+            size_t & m = max_size[b][(size_t)s*GGML_SCHED_H2D_MAX_POS + p];
+            m = std::max(m, sz[p]);
+        }
+    }
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (n_per_set[b] == 0) continue;
+        auto & st = sched->h2d[b];
+        bool grow = st.sizes.size() != n_slots || n_per_set[b] > st.n_per_set;
+        for (size_t k = 0; k < n_slots && !grow; ++k) grow = max_size[b][k] > st.sizes[k];
+        if (!grow) continue;
+        ggml_backend_sched_synchronize(sched);
+        ggml_sched_h2d_free_backend(sched, b);
+        st.n_sets = n_sets;
+        st.n_per_set = n_per_set[b];
+        st.slots.resize(n_slots);
+        st.sizes = max_size[b];
+        size_t total = 0;
+        bool ok = true;
+        for (size_t k = 0; k < n_slots && ok; ++k) {
+            auto & slot = st.slots[k];
+            slot.size = st.sizes[k];
+            if (slot.size == 0) continue; // no split uses this (set, position)
+            slot.buf = ggml_backend_alloc_buffer(sched->backends[b], slot.size);
+            if (slot.buf == NULL) { ok = false; break; }
+            ggml_backend_buffer_clear(slot.buf, 0);
+            slot.ready = ggml_backend_event_new(sched->backends[b]);
+            slot.freed = ggml_backend_event_new(sched->backends[b]);
+            if (slot.ready == NULL || slot.freed == NULL) { ok = false; break; }
+            slot.has_freed = false;
+            total += slot.size;
+        }
+        if (!ok) {
+            fprintf(stderr, "%s: H2D prefetch: could not allocate %.1f MiB of slots on %s, disabling\n", __func__,
+                    (double)total/(1024*1024), ggml_backend_name(sched->backends[b]));
+            ggml_sched_h2d_free_backend(sched, b);
+            st.disabled = true;
+            continue;
+        }
+        fprintf(stderr, "%s: H2D prefetch: %s: %d sets, up to %d tensors per split, %.1f MiB of slots\n", __func__,
+                ggml_backend_name(sched->backends[b]), st.n_sets, st.n_per_set, (double)total/(1024*1024));
+    }
+    for (int i = 0; i < sched->n_splits; i++) {
+        auto * split = &sched->splits[i];
+        if (split->h2d_set < 0) continue;
+        const int b = split->backend_id;
+        auto & st = sched->h2d[b];
+        if (st.n_sets == 0) { split->h2d_set = -1; continue; }
+        int pos = 0;
+        for (int j = 0; j < split->n_inputs; ++j) {
+            if (!ggml_sched_h2d_streamed_input(split->inputs[j])) continue;
+            struct ggml_tensor * cpy = tensor_copy(split->inputs[j], b, sched->cur_copy);
+            auto & slot = st.slots[(size_t)split->h2d_set*GGML_SCHED_H2D_MAX_POS + pos];
+            cpy->buffer = slot.buf;
+            cpy->data   = ggml_backend_buffer_get_base(slot.buf);
+            ++pos;
+        }
+    }
+}
+
+// issue the copies of split i's streamed inputs on the transfer stream
+static void ggml_sched_h2d_issue(ggml_backend_sched_t sched, int i) {
+    auto * split = &sched->splits[i];
+    const int b = split->backend_id;
+    auto & st = sched->h2d[b];
+    ggml_backend_t backend = sched->backends[b];
+    int pos = 0;
+    for (int j = 0; j < split->n_inputs; ++j) {
+        struct ggml_tensor * input = split->inputs[j];
+        if (!ggml_sched_h2d_streamed_input(input)) continue;
+        auto & slot = st.slots[(size_t)split->h2d_set*GGML_SCHED_H2D_MAX_POS + pos];
+        struct ggml_tensor * cpy = tensor_copy(input, b, sched->cur_copy);
+        if (slot.has_freed) {
+            backend->iface.event_wait_xfer(backend, slot.freed); // previous user of this slot must be done reading
+        }
+        backend->iface.set_tensor_async_xfer(backend, cpy, input->data, 0, ggml_nbytes(input));
+        backend->iface.event_record_xfer(slot.ready);
+        split->h2d_mask |= (1ull << j);
+        ++pos;
+    }
+    st.in_flight++;
+}
+
+// keep n_sets streamed splits in flight on backend b (only ever called from the thread that drives b)
+static void ggml_sched_h2d_fill_backend(ggml_backend_sched_t sched, int b) {
+    if (sched->h2d_n_sets <= 0) return;
+    auto & st = sched->h2d[b];
+    if (st.n_sets == 0) return;
+    while (st.in_flight < st.n_sets && st.cursor < sched->n_splits) {
+        auto * split = &sched->splits[st.cursor];
+        if (split->backend_id == b && split->h2d_set >= 0 && split->h2d_mask == 0) {
+            ggml_sched_h2d_issue(sched, st.cursor);
+        }
+        st.cursor++;
+    }
+}
+
+static void ggml_sched_h2d_fill(ggml_backend_sched_t sched) {
+    if (sched->h2d_n_sets <= 0) return;
+    for (int b = 0; b < sched->n_backends; ++b) {
+        ggml_sched_h2d_fill_backend(sched, b);
+    }
+}
+
+static void ggml_sched_h2d_begin_backend(ggml_backend_sched_t sched, int b) {
+    if (sched->h2d_n_sets <= 0 || b < 0 || b >= sched->n_backends) return;
+    sched->h2d[b].cursor = 0;
+    sched->h2d[b].in_flight = 0;
+    ggml_sched_h2d_fill_backend(sched, b);
+}
+
+static void ggml_sched_h2d_begin(ggml_backend_sched_t sched) {
+    if (sched->h2d_n_sets <= 0) return;
+    for (int b = 0; b < sched->n_backends; ++b) {
+        ggml_sched_h2d_begin_backend(sched, b);
+    }
+}
+
+// compute stream waits for this split's prefetched copies
+static void ggml_sched_h2d_wait(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
+    if (sched->h2d_n_sets <= 0 || split->h2d_set < 0 || split->h2d_mask == 0) return;
+    const int b = split->backend_id;
+    auto & st = sched->h2d[b];
+    int pos = 0;
+    for (int j = 0; j < split->n_inputs; ++j) {
+        if (!(split->h2d_mask & (1ull << j))) continue;
+        ggml_backend_event_wait(sched->backends[b], st.slots[(size_t)split->h2d_set*GGML_SCHED_H2D_MAX_POS + pos].ready);
+        ++pos;
+    }
+}
+
+// after the split's compute is enqueued: mark its slots reusable and top up the lookahead
+static void ggml_sched_h2d_done(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
+    if (sched->h2d_n_sets <= 0 || split->h2d_set < 0 || split->h2d_mask == 0) return;
+    const int b = split->backend_id;
+    auto & st = sched->h2d[b];
+    int pos = 0;
+    for (int j = 0; j < split->n_inputs; ++j) {
+        if (!(split->h2d_mask & (1ull << j))) continue;
+        auto & slot = st.slots[(size_t)split->h2d_set*GGML_SCHED_H2D_MAX_POS + pos];
+        ggml_backend_event_record(slot.freed);
+        slot.has_freed = true;
+        ++pos;
+    }
+    st.in_flight--;
+    ggml_sched_h2d_fill_backend(sched, b);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
 
     for (auto & item : sched->needs_sync) item = true;
@@ -2297,6 +2539,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             int last_reduce = first_reduce;
             int ith = omp_get_thread_num();
+            ggml_sched_h2d_begin_backend(sched, ith);
 
             struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -2328,7 +2571,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 if (ith == split_backend_id) {
 
+                    ggml_sched_h2d_wait(sched, split);
                     sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
+                    ggml_sched_h2d_done(sched, split);
 
                     if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
                         sched->needs_sync[split_backend_id] = true;
@@ -2372,6 +2617,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         auto compute = [sched, &barrier, first_reduce] (int ith) {
 
             struct ggml_backend_sched_split * splits = sched->splits;
+            ggml_sched_h2d_begin_backend(sched, ith);
 
             std::vector<int32_t> ids;
             std::vector<uint32_t> unique_ids;
@@ -2403,7 +2649,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 if (ith == split_backend_id) {
 
+                    ggml_sched_h2d_wait(sched, split);
                     sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
+                    ggml_sched_h2d_done(sched, split);
                     if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
                         sched->needs_sync[split_backend_id] = true;
                     } else {
@@ -2536,6 +2784,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t moe_next  = 0; // first moe_infos entry with split >= current split
     size_t moe_enq   = 0; // moe_infos entries already enqueued for lookahead
 
+    ggml_sched_h2d_begin(sched);
+
     for (int i = 0; i < sched->n_splits; i++) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
@@ -2561,6 +2811,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        ggml_sched_h2d_wait(sched, split);
+
         // copy the input tensors to the split backend
         ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
 
@@ -2582,10 +2834,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
+        ggml_sched_h2d_fill(sched);
         auto ec = ggml_backend_sched_eval(sched, split_backend, split);
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
         }
+        ggml_sched_h2d_done(sched, split);
 
         // the pages the lookahead streamer just read for this split are one-shot
         // streaming traffic; MADV_COLD them so the decode working set survives
@@ -2624,6 +2878,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     for (int i = 0; i < (GGML_OP_COUNT + 31)/32; ++i) sched->op_offload[i] = 0xffffffff;
 
     sched->debug = getenv("GGML_SCHED_DEBUG") != NULL;
+    if (const char * env = getenv("GGML_SCHED_H2D_PREFETCH")) {
+        sched->h2d_n_sets = std::max(0, atoi(env)) > 1 ? atoi(env) : 0;
+        if (sched->h2d_n_sets > 0) fprintf(stderr, "%s: H2D expert prefetch enabled with %d slot sets\n", __func__, sched->h2d_n_sets);
+    }
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
@@ -2669,6 +2927,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+    if (sched) { for (int b = 0; b < sched->n_backends; ++b) ggml_sched_h2d_free_backend(sched, b); }
     if (sched == NULL) {
         return;
     }
@@ -2714,6 +2973,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+    ggml_sched_h2d_assign(sched);
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;

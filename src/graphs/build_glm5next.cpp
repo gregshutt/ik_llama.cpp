@@ -253,6 +253,85 @@ static ggml_tensor * build_glm5next_mla_attention(
     const int64_t kv_lora_rank = hparams.n_lora_kv;            // 512
     const int64_t n_embd_head_v = hparams.n_embd_head_v_full;  // 256 (value_length_mla)
 
+    // -sm graph: each device computes its head slice of the absorbed MLA attention and the row-split output
+    // projection; the partial outputs are all-reduced. Mirrors build_deepseek2's absorb path without rope.
+    if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH && layer.wo->extra) {
+        auto wo_split = (const ggml_split_tensor_t *)layer.wo->extra;
+        const int n_device = wo_split->n_device;
+        if (!lctx.cparams.flash_attn) {
+            GGML_ABORT("-sm graph for glm5next requires -fa on");
+        }
+        if (lctx.cparams.dsa && pool_cells) {
+            GGML_ABORT("-sm graph for glm5next does not support --dsa yet");
+        }
+        auto cache_repl = (const ggml_split_tensor_t *)kv_self.k_l[il]->extra;
+        GGML_ASSERT(cache_repl && cache_repl->n_device == n_device);
+        auto sp = [](ggml_tensor * t, int id) {
+            auto data = (const ggml_split_tensor_t *)t->extra;
+            GGML_ASSERT(data && data->splits[id]);
+            return data->splits[id];
+        };
+        std::vector<ggml_tensor *> partials(n_device, nullptr);
+        for (int id = 0; id < n_device; ++id) {
+            if (!wo_split->splits[id]) continue;
+            const int il_id = 1000 * il + id;
+
+            auto input  = llm_build_context::get_input_tensor_sm_graph(ctx0, inp, id);
+            auto cur_id = llm_build_context::llm_build_norm(ctx0, input, hparams, sp(layer.attn_norm, id), nullptr, LLM_NORM_RMS, cb, il_id);
+
+            auto qr_id = ggml_mul_mat(ctx0, sp(layer.wq_a, id), cur_id);
+            ggml_build_forward_expand(gf, qr_id);
+            qr_id = llm_build_context::llm_build_norm(ctx0, qr_id, hparams, sp(layer.attn_q_a_norm, id), nullptr, LLM_NORM_RMS, cb, il_id);
+            auto q_id = ggml_mul_mat(ctx0, sp(layer.wq_b, id), qr_id);          // [n_head_local*head_dim, n_tokens]
+            cb(q_id, "q", il_id);
+            const int64_t n_head_local = q_id->ne[0] / head_dim;
+            q_id = ggml_reshape_3d(ctx0, q_id, head_dim, n_head_local, llm.n_tokens);
+            q_id = ggml_permute(ctx0, q_id, 0, 2, 1, 3);                         // [head_dim, n_tokens, n_head_local]
+            auto Qcur_id = ggml_mul_mat(ctx0, sp(layer.wk_b, id), q_id);         // [kv_lora_rank, n_tokens, n_head_local]
+            cb(Qcur_id, "Qcur", il_id);
+
+            auto kv_id = ggml_mul_mat(ctx0, sp(layer.wkv_a_mqa, id), cur_id);    // [kv_lora_rank, n_tokens]
+            ggml_build_forward_expand(gf, kv_id);
+            kv_id = llm_build_context::llm_build_norm(ctx0, kv_id, hparams, sp(layer.attn_kv_a_norm, id), nullptr, LLM_NORM_RMS, cb, il_id);
+            cb(kv_id, "kv_compressed", il_id);
+
+            ggml_tensor * cache_local = cache_repl->splits[id];
+            const auto row_size_l = ggml_row_size(cache_local->type, kv_lora_rank);
+            auto write_view = ggml_view_2d(ctx0, cache_local, kv_lora_rank, llm.n_tokens, row_size_l, row_size_l * llm.kv_head);
+            const int cc_idx = 2 * n_device * il + 2 * id;
+            GGML_ASSERT(cc_idx + 1 < (int)lctx.cache_copies.size());
+            lctx.cache_copies[cc_idx + 0].cpy  = ggml_cpy(ctx0, kv_id, write_view);
+            lctx.cache_copies[cc_idx + 0].step = row_size_l;
+            ggml_build_forward_expand(gf, lctx.cache_copies[cc_idx + 0].cpy);
+
+            auto K_local = ggml_view_2d(ctx0, cache_local, kv_lora_rank, llm.n_kv, row_size_l, 0);
+            cb(K_local, "kv_cache", il_id);
+
+            auto kqv_id = ggml_flash_attn_ext(ctx0, Qcur_id, K_local, K_local, KQ_mask, kq_scale, hparams.f_max_alibi_bias, 0.f);
+            if (K_local->ne[1] < 256) {
+                ggml_flash_attn_ext_set_prec(kqv_id, GGML_PREC_F32);
+            }
+            cb(kqv_id, "kqv_compressed", il_id);
+            kqv_id = ggml_permute(ctx0, kqv_id, 0, 2, 1, 3);                     // [kv_lora_rank, n_tokens, n_head_local]
+
+            auto out_id = ggml_mul_mat(ctx0, sp(layer.wv_b, id), kqv_id);        // [n_embd_head_v, n_tokens, n_head_local]
+            out_id = ggml_cont(ctx0, ggml_permute(ctx0, out_id, 0, 2, 1, 3));    // [n_embd_head_v, n_head_local, n_tokens]
+            out_id = ggml_reshape_2d(ctx0, out_id, n_embd_head_v * n_head_local, llm.n_tokens);
+
+            auto partial = llm_build_context::llm_build_lora_mm(lctx, ctx0, wo_split->splits[id], out_id);
+            if (partial->ne[1] > 32 && lctx.cparams.reduce_type != GGML_TYPE_F32) {
+                partial = ggml_cast(ctx0, partial, lctx.cparams.reduce_type);
+            }
+            ggml_build_forward_expand(gf, partial);
+            partials[id] = partial;
+        }
+        auto combined = ggml_reduce(ctx0, partials.data(), n_device, GGML_OP_ADD);
+        ggml_build_forward_expand(gf, combined);
+        cb(combined, "kqv_out", il);
+        return combined;
+    }
+
+
     // norm
     auto cur = llm_build_context::llm_build_norm(ctx0, inp, hparams, layer.attn_norm, nullptr, LLM_NORM_RMS, cb, il);
     cb(cur, "attn_norm", il);
@@ -489,7 +568,7 @@ ggml_cgraph * llm_build_context::build_glm5next_mtp() {
             mtp_layer.ffn_gate_shexp, nullptr, nullptr,
             mtp_layer.ffn_down_shexp, nullptr, nullptr,
             nullptr,
-            LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+            LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf);
     cb(ffn_shexp, "ffn_shexp", il);
 
     cur = ggml_add(ctx0, moe_out, ffn_shexp);
@@ -608,6 +687,9 @@ ggml_cgraph * llm_build_context::build_glm5next() {
                     pool_cells, pool_bias, tail_cells, ape_slots);
         }
 
+        if (cur->type != GGML_TYPE_F32) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F32); // -sm graph: attention partials are reduced in reduce_type
+        }
         inpL = build_mhc_post(cur, post_attn, residual_attn, comb_attn, n_embd, hc, true);
         cb(inpL, "attn_out", il);
 
@@ -633,7 +715,7 @@ ggml_cgraph * llm_build_context::build_glm5next() {
                     model.layers[il].ffn_gate, nullptr, nullptr,
                     model.layers[il].ffn_down, nullptr, nullptr,
                     nullptr,
-                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf);
         } else {
             // MoE: routed experts (add_input=false, mHC owns the residual) + shared expert
             auto moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
@@ -655,14 +737,23 @@ ggml_cgraph * llm_build_context::build_glm5next() {
                     model.layers[il].ffn_gate_shexp, nullptr, nullptr,
                     model.layers[il].ffn_down_shexp, nullptr, nullptr,
                     nullptr,
-                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf);
             cb(ffn_shexp, "ffn_shexp", il);
 
+            if (moe_out->type != GGML_TYPE_F32) {
+                moe_out = ggml_cast(ctx0, moe_out, GGML_TYPE_F32);
+            }
+            if (ffn_shexp->type != GGML_TYPE_F32) {
+                ffn_shexp = ggml_cast(ctx0, ffn_shexp, GGML_TYPE_F32);
+            }
             cur = ggml_add(ctx0, moe_out, ffn_shexp);
             ggml_build_forward_expand(gf, cur);
         }
         cb(cur, "ffn_out", il);
 
+        if (cur->type != GGML_TYPE_F32) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F32); // -sm graph: FFN partials are reduced in reduce_type
+        }
         inpL = build_mhc_post(cur, post_ffn, residual_ffn, comb_ffn, n_embd, hc, true);
         inpL = lctx.cvec.apply_to(ctx0, inpL, il);
         if (lctx.dflash.capture && llama_dflash_capture_layer_requested(lctx.dflash.capture->layer_ids, il)) {
