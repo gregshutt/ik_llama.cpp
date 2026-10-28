@@ -701,6 +701,15 @@ struct llama_context {
     struct ggml_tensor * inp_kpool_bias      = nullptr; // F32 [n_pool, n_tokens] 0 if pool complete & visible to query, else -inf
     struct ggml_tensor * inp_kpool_tail      = nullptr; // I32 [kpool-1, n_tokens] trailing incomplete pool cells (null when kpool==1)
     struct ggml_tensor * inp_kpool_ape_slots = nullptr; // I32 [kpool] identity [0..kpool-1], gathers the ape rows in order
+    // direct (maskless) k-pool DSA selection, see build_glm5next_dsa_select: inp_kpool_cells carries an extra
+    // all -1 sentinel pool row and inp_kpool_tail is [n_idx - kpool*n_sel, n_tokens] with -1 in unused slots
+    bool kpool_direct = false;
+    int64_t kpool_n_kv = 0;                             // cache view the pool tables cover (padded last used cell), 0 = kv_self.n
+    struct ggml_tensor * inp_kpool_nvis      = nullptr; // I32 [n_tokens]    number of leading pools (by position) visible to each query
+    struct ggml_tensor * inp_kpool_ok        = nullptr; // I32 [n_pool]      1 if the pool is complete (all kpool members cached)
+    // pooled-key cache (kv_self.kp_l): only the pools this ubatch writes into are pooled again
+    struct ggml_tensor * inp_kpool_win_pools = nullptr; // I32 [n_win]       which pool each entry rebuilds
+    struct ggml_tensor * inp_kpool_win_cells = nullptr; // I32 [kpool*n_win] member cells of those pools, in slot order
 
     // Qwen sparse attention: everything that depends on cache layout is computed on the host,
     // so the graph only gathers, pools and scores. One entry per distinct compress ratio.

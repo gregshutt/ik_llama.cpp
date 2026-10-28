@@ -15,7 +15,8 @@ static __global__ void k_prepare_mask(int nidx, const int * __restrict__ idx, co
     int col = blockIdx.y*blockDim.x + threadIdx.x;
     idx += row*stride_idx;
     int ii = idx[col];
-    m_out[row*nidx + col] = ii >= 0 ? m_in[row*stride_m + ii] : __float2half(-INFINITY);
+    // no mask: the index list already encodes visibility (-1 = no key)
+    m_out[row*nidx + col] = ii >= 0 ? (m_in ? m_in[row*stride_m + ii] : __float2half(0.0f)) : __float2half(-INFINITY);
 }
 
 static __global__ void k_prepare_one_batch_kv(int nk, int ncol, const int * idx, const char * k_in,
@@ -255,7 +256,7 @@ bool ggml_cuda_dsa_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const ggml_tensor * sink = dst->src[4];
     const ggml_tensor * indexer = dst->src[5];
 
-    if (!Q || !K || !V || !mask || !indexer) return false;
+    if (!Q || !K || !V || !indexer) return false;
 
     if (indexer->ne[0] % 256 != 0) return false; // lazyness to add checks and handle tails in case of not multiple of 256
                                                  // But are there DSA variants where top_k is not a multiple of 256?
@@ -265,9 +266,9 @@ bool ggml_cuda_dsa_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     } else {
         if (K->ne[1] < 4*indexer->ne[0]) return false; // for efficiency
     }
-    if (K->ne[2] > 1 || K->ne[3] > 1 || mask->ne[2] > 1 || mask->ne[3] > 1 || Q->ne[3] > 1) return false;
+    if (K->ne[2] > 1 || K->ne[3] > 1 || (mask && (mask->ne[2] > 1 || mask->ne[3] > 1)) || Q->ne[3] > 1) return false;
     if ((K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0) ||
-        (V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_Q8_0) || mask->type != GGML_TYPE_F16 || Q->type != GGML_TYPE_F32) return false;
+        (V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_Q8_0) || (mask && mask->type != GGML_TYPE_F16) || Q->type != GGML_TYPE_F32) return false;
     if (K->ne[0] != Q->ne[0]) return false;
 
     //printf("%s(%s)\n", __func__, dst->name);
@@ -306,7 +307,7 @@ bool ggml_cuda_dsa_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     {
         dim3 grid(Q->ne[1], indexer->ne[0]/256, 1);
         k_prepare_mask<<<grid, 256, 0, ctx.stream()>>>(indexer->ne[0], (const int * )indexer->data,
-                (const half *)mask->data, mask16.get(), stride_idx, mask->nb[1]/sizeof(half));
+                mask ? (const half *)mask->data : nullptr, mask16.get(), stride_idx, mask ? mask->nb[1]/sizeof(half) : 0);
     }
 
     int nstep = (Q->ne[1] + max_rows - 1)/max_rows;

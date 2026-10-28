@@ -20,6 +20,7 @@
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
+#include <cinttypes>
 
 #define IK_PRINT_TIMING 0
 
@@ -2570,6 +2571,15 @@ static void ggml_sched_timing_report(ggml_backend_sched_t sched) {
             fprintf(stderr, "[sched-timing]  #%4d b%d nodes %4d in %2d h2d %6.0f MB | host pre %8.2f eval %8.2f post %7.2f ms | gpu wait %8.2f comp %8.2f ms\n",
                     r.split, r.backend, r.n_nodes, r.n_inputs, r.h2d_bytes / 1e6,
                     r.host_pre_us / 1000.0, r.host_eval_us / 1000.0, r.host_post_us / 1000.0, r.gpu_wait_ms, r.gpu_comp_ms);
+            if (sched->timing >= 3 && r.split >= 0 && r.split < sched->n_splits) {
+                const auto & sp = sched->splits[r.split];
+                for (int j = 0; j < sp.n_inputs; ++j) {
+                    const ggml_tensor * in = sp.inputs[j];
+                    fprintf(stderr, "[sched-timing]        input %d: %s op %s type %s %" PRId64 "x%" PRId64 " buffer %s\n", j, in->name,
+                            ggml_op_name(in->op), ggml_type_name(in->type), in->ne[0], in->ne[1],
+                            in->buffer ? ggml_backend_buffer_name(in->buffer) : "-");
+                }
+            }
         }
     }
     fflush(stderr);

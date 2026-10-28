@@ -10676,6 +10676,42 @@ struct ggml_tensor * ggml_indexer_topk(
     return result;
 }
 
+struct ggml_tensor * ggml_indexer_topk_nvis(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * n_vis,
+            struct ggml_tensor  * col_ok,
+            enum ggml_unary_op    op,
+            int                   n_top_k,
+            int                   sentinel) {
+    GGML_ASSERT(k->ne[2] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(k->ne[0] == q->ne[0]);
+    GGML_ASSERT(k->ne[1] >= n_top_k);
+    GGML_ASSERT(n_vis->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nrows(n_vis) == 1 && n_vis->ne[0] == q->ne[2]);
+    if (col_ok) {
+        GGML_ASSERT(col_ok->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_nrows(col_ok) == 1 && col_ok->ne[0] == k->ne[1]);
+    }
+    GGML_ASSERT(q->ne[1] == w->ne[0]);
+    GGML_ASSERT(q->ne[2] == w->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_top_k, q->ne[2]);
+    result->op = GGML_OP_INDEXER_TOPK;
+    result->op_params[0] = (int)op;
+    result->op_params[1] = sentinel;
+    result->src[0] = k;
+    result->src[1] = q;
+    result->src[2] = w;
+    result->src[3] = n_vis;
+    result->src[4] = NULL;
+    result->src[5] = col_ok;
+
+    return result;
+}
+
 
 struct ggml_tensor * ggml_sinkhorn(
             struct ggml_context * ctx,
@@ -27393,6 +27429,9 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             } break;
         case GGML_OP_INDEXER_TOPK:
             {
+                if (tensor->src[3] && tensor->src[3]->type == GGML_TYPE_I32) {
+                    GGML_ABORT("indexer_topk: the n_vis variant (ggml_indexer_topk_nvis) is CUDA-only");
+                }
                 if (!iqk_indexer_topk(tensor, params->wdata, (barrier_t)ggml_barrier, (void *)params->shared, params->ith, params->nth)) {
                     GGML_ABORT("Fatal error");
                 }

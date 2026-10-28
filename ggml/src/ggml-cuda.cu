@@ -5234,6 +5234,13 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_CONCAT:
             {
                 ggml_type src0_type = op->src[0]->type;
+                if (src0_type == GGML_TYPE_I32) {
+                    // the contiguous dim-0 path copies 32-bit words, so index lists (DSA KV index
+                    // lists) concatenate on the device instead of forcing a CPU split per layer
+                    const int32_t dim = ((const int32_t *) op->op_params)[0];
+                    return dim == 0 && op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32 &&
+                           ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                }
                 return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
             } break;
         case GGML_OP_CONV_TRANSPOSE_1D:

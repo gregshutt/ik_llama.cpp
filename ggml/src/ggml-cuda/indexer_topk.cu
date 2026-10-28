@@ -85,6 +85,47 @@ static __global__ void k_copy_topk(const int * __restrict__ sorted, int * dst, c
     }
 }
 
+// n_vis variant (ggml_indexer_topk_nvis): column col of row `row` is visible iff col < n_vis[row] and
+// (col_ok == nullptr || col_ok[col]); invisible columns score -inf and sort last.
+template <typename kq_t>
+static __global__ void k_fused_relu_mul_sum_rows_nvis(const kq_t * __restrict__ kq, const float * __restrict__ w,
+        const int * __restrict__ n_vis, const int * __restrict__ col_ok,
+        float * __restrict__ dst, const int ncols, const int nhead) {
+    const int row = blockIdx.x;
+    const int col = blockIdx.y*blockDim.x + threadIdx.x;
+    if (col >= ncols) {
+        return;
+    }
+    float sum = -INFINITY;
+    if (col < n_vis[row] && (col_ok == nullptr || col_ok[col] != 0)) {
+        const int64_t step = (int64_t)ncols*nhead;
+        auto this_w  = w + row*nhead;
+        auto this_kq = kq + row*step;
+        sum = 0.0f;
+        for (int head = 0; head < nhead; ++head) {
+            float relu = (float)this_kq[col];
+            relu = relu > 0.0f ? relu : 0.0f;
+            sum += relu * this_w[head];
+            this_kq += ncols;
+        }
+    }
+    dst[(int64_t)ncols*row + col] = sum;
+}
+
+// slots whose column was invisible (score -inf) get the sentinel instead of a column id
+static __global__ void k_copy_topk_sentinel(const int * __restrict__ sorted, const float * __restrict__ score,
+        int * dst, const int ncols, const int n_top_k, const int sentinel) {
+    const int row = blockIdx.x;
+    const int col = threadIdx.x;
+    sorted += int64_t(ncols)*row;
+    score  += int64_t(ncols)*row;
+    dst    += int64_t(n_top_k)*row;
+    for (int i = col; i < n_top_k; i += blockDim.x) {
+        const int j = sorted[i];
+        dst[i] = score[j] == -INFINITY ? sentinel : j;
+    }
+}
+
 void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     auto op = ggml_unary_op(dst->op_params[0]);
     GGML_ASSERT(op == GGML_UNARY_OP_RELU);
@@ -94,14 +135,25 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     auto m = dst->src[3];
     auto c = dst->src[4];
     int n_top_k = dst->ne[0];
-    int n_kv    = m->ne[0];
+    // n_vis variant (ggml_indexer_topk_nvis): m is I32 [T] = visible column count per query row,
+    // src[5] an optional I32 [n_cols] column validity, op_params[1] the sentinel for unpicked slots
+    const bool nvis_mode = m->type == GGML_TYPE_I32;
+    const ggml_tensor * col_ok = nvis_mode ? dst->src[5] : nullptr;
+    const int sentinel = dst->op_params[1];
+    int n_kv    = nvis_mode ? (int) k->ne[1] : (int) m->ne[0];
     int n_head  = q->ne[1];
     //if (k->type != GGML_TYPE_F16 && !ggml_is_quantized(k->type)) printf("%s: K is %s?\n", __func__, ggml_type_name(k->type));
     GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 ||
                 k->type == GGML_TYPE_F32 || ggml_is_quantized(k->type));
     GGML_ASSERT(k->ne[2] == 1 || k->ne[3] == 1);
     GGML_ASSERT(k->ne[0] == q->ne[0]);
-    if (c) {
+    if (nvis_mode) {
+        GGML_ASSERT(!c);
+        GGML_ASSERT(k->ne[1] >= n_top_k);
+        GGML_ASSERT(ggml_nrows(m) == 1 && m->ne[0] == q->ne[2]);
+        GGML_ASSERT(!col_ok || (col_ok->type == GGML_TYPE_I32 && ggml_nrows(col_ok) == 1 && col_ok->ne[0] == k->ne[1]));
+        GGML_ASSERT((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && "indexer_topk n_vis variant needs an f16 or q8_0 k");
+    } else if (c) {
         GGML_ASSERT(c->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_nrows(c) == 1);
         GGML_ASSERT(c->ne[0] == m->ne[0]);
@@ -110,12 +162,12 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         GGML_ASSERT(k->ne[1] > n_top_k);
         GGML_ASSERT(k->ne[1] == m->ne[0]);
     }
-    GGML_ASSERT(q->ne[2] == m->ne[1]);
+    GGML_ASSERT(nvis_mode || q->ne[2] == m->ne[1]);
     GGML_ASSERT(q->ne[1] == w->ne[0]);
     GGML_ASSERT(q->ne[2] == w->ne[1]);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(w->type == GGML_TYPE_F32);
-    GGML_ASSERT(m->type == GGML_TYPE_F32 || m->type == GGML_TYPE_F16);
+    GGML_ASSERT(nvis_mode || m->type == GGML_TYPE_F32 || m->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(w));
 
@@ -169,7 +221,16 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                     CUBLAS_COMPUTE_32F,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
-            if (c) {
+            if (nvis_mode) {
+                int nblocks = (n_kv + k_block_size - 1)/k_block_size;
+                dim3 grid(nrows, nblocks, 1);
+                k_fused_relu_mul_sum_rows_nvis<<<grid, k_block_size, 0, ctx.stream()>>>(kq.get(),
+                        (const float *)w->data + first_row*q->ne[1],
+                        (const int *)m->data + first_row,
+                        col_ok ? (const int *)col_ok->data : nullptr,
+                        score.get(), n_kv, q->ne[1]);
+                CUDA_CHECK(cudaGetLastError());
+            } else if (c) {
                 int nblocks = (n_kv + k_block_size - 1)/k_block_size;
                 dim3 grid(nrows, nblocks, 1);
                 if (m->type == GGML_TYPE_F32) {
@@ -206,14 +267,21 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             argsort_f32_i32_cuda_cub(ctx.pool(), score.get(), sorted.get(), n_kv, nrows, GGML_SORT_ORDER_DESC, ctx.stream());
             CUDA_CHECK(cudaGetLastError());
 
-            k_copy_topk<<<nrows, k_block_size, 0, ctx.stream()>>>(sorted.get(),
-                    (int *)((char *)dst->data + first_row*dst->nb[1]), n_kv, dst->ne[0]);
+            if (nvis_mode) {
+                k_copy_topk_sentinel<<<nrows, k_block_size, 0, ctx.stream()>>>(sorted.get(), score.get(),
+                        (int *)((char *)dst->data + first_row*dst->nb[1]), n_kv, dst->ne[0], sentinel);
+            } else {
+                k_copy_topk<<<nrows, k_block_size, 0, ctx.stream()>>>(sorted.get(),
+                        (int *)((char *)dst->data + first_row*dst->nb[1]), n_kv, dst->ne[0]);
+            }
             CUDA_CHECK(cudaGetLastError());
         }
 
         return;
 
     }
+
+    GGML_ASSERT(!nvis_mode && "indexer_topk n_vis variant: unsupported k/q types");
 
     constexpr int64_t k_max_work_buffer_elements = 1 << 26;
 

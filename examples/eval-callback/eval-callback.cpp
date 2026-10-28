@@ -3,6 +3,7 @@
 #include "ggml.h"
 
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <string>
 #include <tuple>
@@ -101,6 +102,60 @@ static void ggml_print_tensor(uint8_t * data, ggml_type type, const int64_t * ne
  * @param user_data user data to pass at each call back
  * @return true to receive data or continue the graph, false otherwise
  */
+// EVAL_CB_DUMP_DIR=<dir>: write every tensor whose name contains one of the comma-separated EVAL_CB_DUMP_FILTER
+// substrings (default: all) as f32
+// to <dir>/<name>.bin (header: int32 ne0, int32 n_rows; then rows). EVAL_CB_DUMP_COLS=n keeps only the last
+// n rows (the last n tokens of a [ne0, n_tokens] activation). EVAL_CB_QUIET=1 suppresses the prints.
+static const char * dump_dir    = getenv("EVAL_CB_DUMP_DIR");
+static const char * dump_filter = getenv("EVAL_CB_DUMP_FILTER");
+static const int    dump_cols   = getenv("EVAL_CB_DUMP_COLS") ? atoi(getenv("EVAL_CB_DUMP_COLS")) : 0;
+static const bool   quiet       = getenv("EVAL_CB_QUIET") != nullptr;
+
+static bool dump_wanted(const struct ggml_tensor * t) {
+    if (!dump_dir || ggml_is_quantized(t->type)) {
+        return false;
+    }
+    if (!dump_filter) {
+        return true;
+    }
+    // comma-separated list of substrings
+    std::string f(dump_filter);
+    for (size_t i = 0; i < f.size();) {
+        size_t j = f.find(',', i);
+        if (j == std::string::npos) j = f.size();
+        if (j > i && strstr(t->name, f.substr(i, j - i).c_str()) != nullptr) {
+            return true;
+        }
+        i = j + 1;
+    }
+    return false;
+}
+
+static void dump_tensor(const struct ggml_tensor * t, const uint8_t * data) {
+    const int64_t ne0 = t->ne[0];
+    const int64_t nr  = ggml_nrows(t);
+    const int64_t r0  = dump_cols > 0 && dump_cols < nr ? nr - dump_cols : 0;
+    std::string path = std::string(dump_dir) + "/" + t->name + ".bin";
+    FILE * f = fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "dump: cannot open %s\n", path.c_str());
+        return;
+    }
+    const int32_t hdr[2] = { (int32_t) ne0, (int32_t) (nr - r0) };
+    fwrite(hdr, sizeof(hdr), 1, f);
+    std::vector<float> row(ne0);
+    for (int64_t r = r0; r < nr; ++r) {
+        // row r of the tensor viewed as [ne0, nrows] (rows run over ne1, ne2, ne3 in order)
+        int64_t i1 = r % t->ne[1], i2 = (r / t->ne[1]) % t->ne[2], i3 = r / (t->ne[1] * t->ne[2]);
+        const uint8_t * p = data + i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
+        for (int64_t i = 0; i < ne0; ++i) {
+            row[i] = ggml_get_float_value((uint8_t *) p, t->type, i * t->nb[0]);
+        }
+        fwrite(row.data(), sizeof(float), ne0, f);
+    }
+    fclose(f);
+}
+
 static int ggml_debug(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * cb_data = (callback_data *) user_data;
 
@@ -108,7 +163,22 @@ static int ggml_debug(struct ggml_tensor * t, bool ask, void * user_data) {
     const struct ggml_tensor * src1 = t->src[1];
 
     if (ask) {
-        return 1; // Always retrieve data
+        return dump_dir ? (dump_wanted(t) ? 1 : 0) : 1; // when dumping, only fetch what is dumped
+    }
+    if (dump_dir) {
+        if (!dump_wanted(t)) {
+            return 1;
+        }
+        const bool is_host = ggml_backend_buffer_is_host(t->buffer);
+        if (!is_host) {
+            auto n_bytes = ggml_nbytes(t);
+            cb_data->data.resize(n_bytes);
+            ggml_backend_tensor_get(t, cb_data->data.data(), 0, n_bytes);
+        }
+        dump_tensor(t, is_host ? (const uint8_t *) t->data : cb_data->data.data());
+        if (quiet) {
+            return 1;
+        }
     }
 
     char src1_str[128] = {0};
@@ -132,7 +202,7 @@ static int ggml_debug(struct ggml_tensor * t, bool ask, void * user_data) {
         ggml_backend_tensor_get(t, cb_data->data.data(), 0, n_bytes);
     }
 
-    if (!ggml_is_quantized(t->type)) {
+    if (!ggml_is_quantized(t->type) && !quiet) {
         uint8_t * data = is_host ? (uint8_t *) t->data : cb_data->data.data();
         ggml_print_tensor(data, t->type, t->ne, t->nb, 3);
     }

@@ -55,6 +55,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if (ggml_cuda_dsa_attn_ext(ctx, dst)) {
             return;
         }
+        // without a mask the dense kernels below would attend to every key, causally unmasked
+        GGML_ASSERT(mask && "flash_attn_ext: KV index list without a mask, but no sparse kernel accepted the op");
     }
 
     ggml_tensor local_dst, Kl, Vl, Ml;

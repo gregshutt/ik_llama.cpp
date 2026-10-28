@@ -1876,13 +1876,17 @@ static __global__ void flash_attn_kv_idx_to_KV_max(
         const int * __restrict__ kv_idx, int * __restrict__ KV_max, const int n_kv, const int s1) {
     kv_idx += blockIdx.x*s1;
 
+    // one past the last valid (>= 0) entry: a list may have -1 holes before its end (they are
+    // masked and gathered from row 0), so a plain count would cut off the last valid entries
     int n = 0;
     for (int i = threadIdx.x; i < n_kv; i += WARP_SIZE) {
-        n += kv_idx[i] >= 0;
+        if (kv_idx[i] >= 0) {
+            n = i + 1;
+        }
     }
 #pragma unroll
     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
-        n += __shfl_xor_sync(0xFFFFFFFF, n, offset, WARP_SIZE);
+        n = max(n, __shfl_xor_sync(0xFFFFFFFF, n, offset, WARP_SIZE));
     }
 
     if (threadIdx.x == 0) {
@@ -2482,6 +2486,19 @@ bool ggml_cuda_flash_attn_ext_mma_new_sparse(ggml_backend_cuda_context & ctx, gg
         return false;
     }
 
+    // heads per tile: every tile gathers its own copy of the listed K rows, so more heads per tile
+    // means fewer gathers per query (GGML_DSA_FA_NCOLS2 = 16 | 32 | 64, default 64: on GPU3 the
+    // 8192-query layer call took 141 / 116 / 68 ms for 16 / 32 / 64)
+    static const int ncols2_env = getenv("GGML_DSA_FA_NCOLS2") ? atoi(getenv("GGML_DSA_FA_NCOLS2")) : 64;
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    if (ncols2_env >= 64 && gqa_ratio % 64 == 0) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 64, true, true>(ctx, dst);
+        return true;
+    }
+    if (ncols2_env >= 32 && gqa_ratio % 32 == 0) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 32, true, true>(ctx, dst);
+        return true;
+    }
     ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 16, true, true>(ctx, dst);
     return true;
 }
