@@ -85,11 +85,12 @@ static __global__ void k_copy_topk(const int * __restrict__ sorted, int * dst, c
     }
 }
 
-// n_vis variant (ggml_indexer_topk_nvis): column col of row `row` is visible iff col < n_vis[row] and
-// (col_ok == nullptr || col_ok[col]); invisible columns score -inf and sort last.
+// n_vis variant (ggml_indexer_topk_nvis): column col of row `row` is visible iff lo <= col < lo + n_vis[row]
+// (lo = vis_lo[row], 0 without vis_lo) and (col_ok == nullptr || col_ok[col]); invisible columns score -inf
+// and sort last.
 template <typename kq_t>
 static __global__ void k_fused_relu_mul_sum_rows_nvis(const kq_t * __restrict__ kq, const float * __restrict__ w,
-        const int * __restrict__ n_vis, const int * __restrict__ col_ok,
+        const int * __restrict__ n_vis, const int * __restrict__ vis_lo, const int * __restrict__ col_ok,
         float * __restrict__ dst, const int ncols, const int nhead) {
     const int row = blockIdx.x;
     const int col = blockIdx.y*blockDim.x + threadIdx.x;
@@ -97,7 +98,8 @@ static __global__ void k_fused_relu_mul_sum_rows_nvis(const kq_t * __restrict__ 
         return;
     }
     float sum = -INFINITY;
-    if (col < n_vis[row] && (col_ok == nullptr || col_ok[col] != 0)) {
+    const int lo = vis_lo ? vis_lo[row] : 0;
+    if (col >= lo && col < lo + n_vis[row] && (col_ok == nullptr || col_ok[col] != 0)) {
         const int64_t step = (int64_t)ncols*nhead;
         auto this_w  = w + row*nhead;
         auto this_kq = kq + row*step;
@@ -126,6 +128,19 @@ static __global__ void k_copy_topk_sentinel(const int * __restrict__ sorted, con
     }
 }
 
+// col_row variant: column c of the scored key set is row col_row[c] of k (a negative row scores zero)
+static __global__ void k_gather_rows_f16(const half * __restrict__ src, const int * __restrict__ rows,
+        half * __restrict__ dst, const int ne0, const int n_rows_src) {
+    const int col = blockIdx.x;
+    const int r   = rows[col];
+    const half * s = (r >= 0 && r < n_rows_src) ? src + (int64_t) r * ne0 : nullptr;
+    half * d = dst + (int64_t) col * ne0;
+    const half zero = __float2half(0.0f);
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) {
+        d[i] = s ? s[i] : zero;
+    }
+}
+
 void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     auto op = ggml_unary_op(dst->op_params[0]);
     GGML_ASSERT(op == GGML_UNARY_OP_RELU);
@@ -138,10 +153,14 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     // n_vis variant (ggml_indexer_topk_nvis): m is I32 [T] = visible column count per query row,
     // src[5] an optional I32 [n_cols] column validity, op_params[1] the sentinel for unpicked slots
     const bool nvis_mode = m->type == GGML_TYPE_I32;
-    const ggml_tensor * col_ok = nvis_mode ? dst->src[5] : nullptr;
+    const ggml_tensor * col_ok  = nvis_mode ? dst->src[5] : nullptr;
+    const ggml_tensor * vis_lo  = nvis_mode ? dst->src[6] : nullptr;   // optional I32 [T]: first visible column
+    const ggml_tensor * col_row = nvis_mode ? dst->src[7] : nullptr;   // optional I32 [n_cols]: k row of each column
     const int sentinel = dst->op_params[1];
-    int n_kv    = nvis_mode ? (int) k->ne[1] : (int) m->ne[0];
+    int n_kv    = nvis_mode ? (int) (col_row ? col_row->ne[0] : k->ne[1]) : (int) m->ne[0];
     int n_head  = q->ne[1];
+    // columns of the scored key set: the gathered rows in the col_row form, else the rows of k
+    const int n_kcols = nvis_mode ? n_kv : (int) k->ne[1];
     //if (k->type != GGML_TYPE_F16 && !ggml_is_quantized(k->type)) printf("%s: K is %s?\n", __func__, ggml_type_name(k->type));
     GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 ||
                 k->type == GGML_TYPE_F32 || ggml_is_quantized(k->type));
@@ -149,9 +168,11 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     GGML_ASSERT(k->ne[0] == q->ne[0]);
     if (nvis_mode) {
         GGML_ASSERT(!c);
-        GGML_ASSERT(k->ne[1] >= n_top_k);
+        GGML_ASSERT(n_kv >= n_top_k);
         GGML_ASSERT(ggml_nrows(m) == 1 && m->ne[0] == q->ne[2]);
-        GGML_ASSERT(!col_ok || (col_ok->type == GGML_TYPE_I32 && ggml_nrows(col_ok) == 1 && col_ok->ne[0] == k->ne[1]));
+        GGML_ASSERT(!col_ok  || (col_ok->type  == GGML_TYPE_I32 && ggml_nrows(col_ok)  == 1 && col_ok->ne[0]  == n_kv));
+        GGML_ASSERT(!vis_lo  || (vis_lo->type  == GGML_TYPE_I32 && ggml_nrows(vis_lo)  == 1 && vis_lo->ne[0]  == q->ne[2]));
+        GGML_ASSERT(!col_row || (col_row->type == GGML_TYPE_I32 && ggml_nrows(col_row) == 1));
         GGML_ASSERT((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && "indexer_topk n_vis variant needs an f16 or q8_0 k");
     } else if (c) {
         GGML_ASSERT(c->type == GGML_TYPE_I32);
@@ -180,11 +201,12 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         max_rows = std::min<int>(max_rows, q->ne[2]);
         int nstep = (q->ne[2] + max_rows - 1)/max_rows;
 
-        ggml_cuda_pool_alloc<float> kq(ctx.pool(), k->ne[1]*q->ne[1]*max_rows);
+        ggml_cuda_pool_alloc<float> kq(ctx.pool(), int64_t(n_kcols)*q->ne[1]*max_rows);
         ggml_cuda_pool_alloc<float> score(ctx.pool(), int64_t(n_kv)*max_rows);
         ggml_cuda_pool_alloc<int>   sorted(ctx.pool(), int64_t(n_kv)*max_rows);
         ggml_cuda_pool_alloc<half>  q_f16(ctx.pool(), q->ne[0]*q->ne[1]*max_rows);
         ggml_cuda_pool_alloc<half>  k_f16(ctx.pool());
+        ggml_cuda_pool_alloc<half>  k_gath(ctx.pool());
 
         auto k_data = (const half *)k->data;
         if (k->type == GGML_TYPE_Q8_0) {
@@ -194,6 +216,14 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             to_fp16_cuda(k->data, k_f16.get(), k->ne[0]*k->ne[1], 1, ctx.stream());
             CUDA_CHECK(cudaGetLastError());
             k_data = k_f16.get();
+        }
+        if (col_row) {
+            // gather the live rows into one compact [ne0, n_cols] key set
+            k_gath.alloc(int64_t(n_kv)*k->ne[0]);
+            k_gather_rows_f16<<<n_kv, 128, 0, ctx.stream()>>>(k_data, (const int *)col_row->data, k_gath.get(),
+                    (int) k->ne[0], (int) k->ne[1]);
+            CUDA_CHECK(cudaGetLastError());
+            k_data = k_gath.get();
         }
 
         auto to_fp16_cuda = ggml_get_to_fp16_cuda(q->type);
@@ -214,10 +244,10 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             CUDA_CHECK(cudaGetLastError());
 
             CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(ctx.device), CUBLAS_OP_T, CUBLAS_OP_N,
-                    k->ne[1], q->ne[1]*nrows, q->ne[0],
+                    n_kcols, q->ne[1]*nrows, q->ne[0],
                     &alpha, k_data,       CUDA_R_16F, k->ne[0],
                             q_f16.get(),  CUDA_R_16F, q->ne[0],
-                    &beta,  kq.get(),     CUDA_R_32F, k->ne[1],
+                    &beta,  kq.get(),     CUDA_R_32F, n_kcols,
                     CUBLAS_COMPUTE_32F,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
@@ -227,6 +257,7 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                 k_fused_relu_mul_sum_rows_nvis<<<grid, k_block_size, 0, ctx.stream()>>>(kq.get(),
                         (const float *)w->data + first_row*q->ne[1],
                         (const int *)m->data + first_row,
+                        vis_lo ? (const int *)vis_lo->data + first_row : nullptr,
                         col_ok ? (const int *)col_ok->data : nullptr,
                         score.get(), n_kv, q->ne[1]);
                 CUDA_CHECK(cudaGetLastError());

@@ -10683,17 +10683,28 @@ struct ggml_tensor * ggml_indexer_topk_nvis(
             struct ggml_tensor  * w,
             struct ggml_tensor  * n_vis,
             struct ggml_tensor  * col_ok,
+            struct ggml_tensor  * vis_lo,
+            struct ggml_tensor  * col_row,
             enum ggml_unary_op    op,
             int                   n_top_k,
             int                   sentinel) {
     GGML_ASSERT(k->ne[2] == 1 && k->ne[3] == 1);
     GGML_ASSERT(k->ne[0] == q->ne[0]);
-    GGML_ASSERT(k->ne[1] >= n_top_k);
+    const int64_t n_cols = col_row ? col_row->ne[0] : k->ne[1];
+    GGML_ASSERT(n_cols >= n_top_k);
     GGML_ASSERT(n_vis->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_nrows(n_vis) == 1 && n_vis->ne[0] == q->ne[2]);
     if (col_ok) {
         GGML_ASSERT(col_ok->type == GGML_TYPE_I32);
-        GGML_ASSERT(ggml_nrows(col_ok) == 1 && col_ok->ne[0] == k->ne[1]);
+        GGML_ASSERT(ggml_nrows(col_ok) == 1 && col_ok->ne[0] == n_cols);
+    }
+    if (vis_lo) {
+        GGML_ASSERT(vis_lo->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_nrows(vis_lo) == 1 && vis_lo->ne[0] == q->ne[2]);
+    }
+    if (col_row) {
+        GGML_ASSERT(col_row->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_nrows(col_row) == 1);
     }
     GGML_ASSERT(q->ne[1] == w->ne[0]);
     GGML_ASSERT(q->ne[2] == w->ne[1]);
@@ -10708,6 +10719,8 @@ struct ggml_tensor * ggml_indexer_topk_nvis(
     result->src[3] = n_vis;
     result->src[4] = NULL;
     result->src[5] = col_ok;
+    result->src[6] = vis_lo;
+    result->src[7] = col_row;
 
     return result;
 }

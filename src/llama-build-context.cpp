@@ -134,6 +134,9 @@ void llm_build_context::init() {
         lctx.inp_kpool_ape_slots = nullptr;
         lctx.kpool_direct        = false;
         lctx.kpool_n_kv          = 0;
+        lctx.kpool_n_pool        = 0;
+        lctx.inp_kpool_lo        = nullptr;
+        lctx.inp_kpool_row       = nullptr;
         lctx.inp_kpool_nvis      = nullptr;
         lctx.inp_kpool_ok        = nullptr;
         lctx.inp_kpool_win_pools = nullptr;

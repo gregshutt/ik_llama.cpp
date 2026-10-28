@@ -73,6 +73,13 @@ struct llama_kv_cell {
     }
 };
 
+// glm5next KPool-DSA with several sequences: the per-ubatch host plan of the indexer's pool tables and the kp_l
+// row allocator (llama_kpool_plan_update in llama.cpp builds it from kv_self and the ubatch)
+#include "llama-kpool-plan.h"
+
+struct llama_context;
+void llama_kpool_plan_update(struct llama_context & lctx, const llama_batch & batch);
+
 // ring-buffer of cached KV data
 struct llama_kv_cache {
     // the FA kernels require padding to avoid extra runtime boundary checks
@@ -710,6 +717,11 @@ struct llama_context {
     // pooled-key cache (kv_self.kp_l): only the pools this ubatch writes into are pooled again
     struct ggml_tensor * inp_kpool_win_pools = nullptr; // I32 [n_win]       which pool each entry rebuilds
     struct ggml_tensor * inp_kpool_win_cells = nullptr; // I32 [kpool*n_win] member cells of those pools, in slot order
+    // several sequences (p9): the pools are enumerated per (sequence, position / kpool) and the pooled keys live
+    // in kp_l rows keyed by the pool's last member cell; see llama_kpool_plan
+    int64_t kpool_n_pool = 0;                           // score columns the pool tables were built with
+    struct ggml_tensor * inp_kpool_lo        = nullptr; // I32 [n_tokens]    first column visible to each query
+    struct ggml_tensor * inp_kpool_row       = nullptr; // I32 [n_pool]      kp_l row of each column (-1 clamped to 0)
 
     // Qwen sparse attention: everything that depends on cache layout is computed on the host,
     // so the graph only gathers, pools and scores. One entry per distinct compress ratio.
@@ -729,6 +741,10 @@ struct llama_context {
     // the pooled block keys no longer match the raw indexer keys and the next built graph must
     // pool every block; set on state restore and defrag, cleared by that graph's host fill
     bool qsa_pooled_stale = false;
+
+    // glm5next KPool-DSA: the per-ubatch pool plan and the kp_l row allocator (llama_kpool_plan_update)
+    llama_kpool_plan kpool_plan;
+    llama_kpool_rows kpool_rows;
 
     // token at each position of a sequence, read by the PLE n-gram hash
     std::map<llama_seq_id, std::vector<llama_token>> ple_hist;

@@ -605,6 +605,8 @@ struct llama_context::Prev {
     int64_t swa_win_off;
     uint64_t seq_fingerprint;
     uint64_t model_state_hash;
+    int64_t kpool_n_kv;     // glm5next KPool-DSA: the pool tables baked into the graph (0: none)
+    int64_t kpool_n_pool;
     ggml_cgraph * graph;
 };
 
@@ -704,6 +706,8 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fi
     if (qsa_pooled_stale) return false; // the rebuild needs a graph with the full pooling window
     auto the_prev = cparams.mtp_op_type == MTP_OP_NONE ? prev.get() : prev_mtp.get();
     if (!the_prev || !the_prev->graph) return false;
+    // glm5next KPool-DSA: the pool tables are sized by the used cells and the pools of every sequence
+    if (kpool_plan.valid && (kpool_plan.n_kv != the_prev->kpool_n_kv || kpool_plan.n_pool != the_prev->kpool_n_pool)) return false;
     if (u_batch.embd) return false;
     if (seq_fingerprint != the_prev->seq_fingerprint) return false;
     if (model_state_hash != the_prev->model_state_hash) return false;
@@ -1537,8 +1541,11 @@ static bool llama_kv_cache_init(
                 cache.kr_l[i] = kr;
                 // the MTP tail runs in its own graph and pools every pool (no kp_l)
                 if (has_glm5next_kpool_cache && !is_mtp_tail_layer) {
+                    // one row per pool, keyed by the pool's last member cell (llama_kpool_plan_update); the rows
+                    // beyond kv_size/kpool hold pools that share only part of their members with another sequence
                     const uint32_t r = hparams.indexer_block_size;
-                    ggml_tensor * kp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hparams.indexer_head_size, (kv_size + r - 1)/r);
+                    const uint32_t n_rows = (kv_size + r - 1)/r + 4*std::max<uint32_t>(1, cparams.n_seq_max) + 64;
+                    ggml_tensor * kp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hparams.indexer_head_size, n_rows);
                     ggml_format_name(kp, "cache_kp_l%d", i);
                     cache.kp_l[i] = kp;
                 }
@@ -5911,6 +5918,30 @@ static void llama_set_engram_rows(llama_context & lctx, const llama_batch & batc
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*sizeof(int32_t));
 }
 
+// glm5next KPool-DSA with several sequences: build this ubatch's pool plan (src/llama-kpool-plan.h) from the cache
+// cells. Called once per ubatch after its slot is found, so this ubatch's cells are in kv_self.cells (the graph
+// writes their [key; gate] rows before it forms the pools); the builder calls it too when it finds no plan.
+void llama_kpool_plan_update(llama_context & lctx, const llama_batch & batch) {
+    auto & kv = lctx.kv_self;
+    lctx.kpool_plan.valid = false;
+    if (kv.kr_l.empty()) {
+        return;
+    }
+    int64_t n_rows = 0;
+    for (auto * t : kv.kp_l) {
+        if (t) { n_rows = t->ne[1]; break; }
+    }
+    const int dropped = llama_kpool_plan_compute(lctx.kpool_plan, lctx.kpool_rows, kv.cells.data(), kv.size, kv.head,
+            (int64_t) lctx.model.hparams.indexer_block_size, n_rows, lctx.cparams.n_seq_max, lctx.qsa_pooled_stale,
+            batch.n_tokens, batch.pos, batch.seq_id);
+    static bool warned = false;
+    if (dropped > 0 && !warned) {
+        LLAMA_LOG_WARN("%s: %d complete pools got no kp_l row (more partly shared pools than the spare rows): they are left out of the selection\n",
+                __func__, dropped);
+        warned = true;
+    }
+}
+
 static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     //
     // set input data
@@ -5972,19 +6003,22 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         }
     }
 
-    // GLM5NEXT k-pool DSA indexer: fill the pool metadata inputs from kv_self.cells
-    // (see inp_kpool_* in llama-context.h; upstream PR #27752 set_input_kpool). One sequence:
-    // pool b holds the cells at positions [b*r, (b+1)*r), in position order.
+    // GLM5NEXT k-pool DSA indexer: copy this ubatch's pool plan (llama_kpool_plan_update) into the graph's host
+    // inputs (see inp_kpool_* in llama-context.h)
     if (lctx.inp_kpool_cells) {
         GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_cells->buffer));
         GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_ape_slots->buffer));
+        auto & plan = lctx.kpool_plan;
+        auto & rows = lctx.kpool_rows;
+        GGML_ASSERT(plan.valid && plan.kv_head == (int32_t) kv_self.head && plan.n_tokens == batch.n_tokens &&
+                "glm5next kpool: the pool plan is not this ubatch's");
 
         const bool    direct = lctx.kpool_direct;
         const int64_t r      = lctx.inp_kpool_ape_slots->ne[0];   // kpool
-        const int64_t n_kv   = lctx.kpool_n_kv > 0 ? lctx.kpool_n_kv : (int64_t) lctx.kv_self.n;
-        const int64_t n_pool = n_kv / r;
-        const int64_t n_tok  = direct ? lctx.inp_kpool_nvis->ne[0] : lctx.inp_kpool_bias->ne[1];
+        const int64_t n_pool = plan.n_pool;
+        const int64_t n_tok  = batch.n_tokens;
         GGML_ASSERT(lctx.inp_kpool_cells->ne[0] == r * (n_pool + (direct ? 1 : 0)));
+        GGML_ASSERT((direct ? lctx.inp_kpool_nvis->ne[0] : lctx.inp_kpool_bias->ne[1]) == n_tok);
 
         int32_t * dst_pool_cells = (int32_t *) lctx.inp_kpool_cells->data;
         int32_t * dst_ape_slots  = (int32_t *) lctx.inp_kpool_ape_slots->data;
@@ -5993,131 +6027,101 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         for (int64_t i = 0; i < r; ++i) {
             dst_ape_slots[i] = (int32_t) i;
         }
-
-        // pool b covers token positions [b*r, (b+1)*r); cell j of pool b is the cache cell with
-        // pos == b*r + (j mod r). Incomplete pools get all-zero cells (kept in gather range by
-        // cell 0) and are excluded by pool_bias / pool_ok below.
-        std::vector<int32_t> filled(n_pool, 0);
-        std::fill(dst_pool_cells, dst_pool_cells + r * n_pool, 0);
-        llama_pos max_pos = -1;
-        for (int64_t i = 0; i < n_kv; ++i) {
-            const auto & cell = kv_self.cells[i];
-            if (cell.pos < 0) continue;
-            max_pos = std::max(max_pos, cell.pos);
-            const int64_t b = cell.pos / r;
-            if (b >= n_pool) continue;
-            dst_pool_cells[b * r + (cell.pos % r)] = (int32_t) i;
-            filled[b]++;
-        }
-        // zero out incomplete pools (cell 0 keeps the gather in range; bias / ok masks them)
-        for (int64_t b = 0; b < n_pool; ++b) {
-            if (filled[b] < (int32_t) r) {
-                std::fill(dst_pool_cells + b * r, dst_pool_cells + (b + 1) * r, 0);
-            }
-        }
+        std::copy(plan.cells.begin(), plan.cells.end(), dst_pool_cells);
         if (direct) {
             // sentinel pool: top-k slots that found no visible pool name it and expand to -1 (no key)
             std::fill(dst_pool_cells + r * n_pool, dst_pool_cells + r * (n_pool + 1), -1);
         }
 
-        // position -> cell (single sequence) for the tail
-        std::vector<int32_t> cell_of_pos(max_pos + 1 >= 0 ? max_pos + 1 : 0, -1);
-        for (int64_t i = 0; i < n_kv; ++i) {
-            const auto & cell = kv_self.cells[i];
-            if (cell.pos >= 0 && cell.pos < (int64_t) cell_of_pos.size()) {
-                cell_of_pos[cell.pos] = (int32_t) i;
+        // pooled-key cache window: the rows this graph pools again (the plan's list; the last entry is repeated
+        // when the window is longer, the scatter then writes the same value twice). A row the window cannot take
+        // keeps a stale key: its pools are left out of this graph's selection and its shadow is cleared so the
+        // next plan lists it again.
+        std::vector<int32_t> ok(plan.ok);
+        if (lctx.inp_kpool_win_pools) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_win_pools->buffer));
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_win_cells->buffer));
+            const int64_t n_win = lctx.inp_kpool_win_pools->ne[0];
+            const int64_t n_rep = (int64_t) plan.repool_rows.size();
+            int32_t * dst_win_pools = (int32_t *) lctx.inp_kpool_win_pools->data;
+            int32_t * dst_win_cells = (int32_t *) lctx.inp_kpool_win_cells->data;
+            for (int64_t w = 0; w < n_win; ++w) {
+                const int64_t e = std::min<int64_t>(w, n_rep - 1);
+                dst_win_pools[w] = plan.repool_rows[e];
+                std::copy_n(plan.repool_cells.data() + e * r, r, dst_win_cells + w * r);
             }
+            for (int64_t e = 0; e < n_rep; ++e) {
+                const int64_t row = plan.repool_rows[e];
+                if (e < n_win) {
+                    std::copy_n(plan.repool_cells.data() + e * r, r, rows.members.begin() + row * r);
+                } else {
+                    std::fill_n(rows.members.begin() + row * r, r, -1);
+                }
+            }
+            if (n_rep > n_win) {
+                std::vector<uint8_t> dropped(plan.n_rows, 0);
+                for (int64_t e = n_win; e < n_rep; ++e) {
+                    dropped[plan.repool_rows[e]] = 1;
+                }
+                for (int64_t b = 0; b < n_pool; ++b) {
+                    if (ok[b] && dropped[plan.row[b]]) ok[b] = 0;
+                }
+                static int n_warn = 0;
+                if (n_warn++ < 3) {
+                    LLAMA_LOG_WARN("%s: glm5next kpool: %d pools to pool again but a window of %d: the rest wait for the next graph\n",
+                            __func__, (int) n_rep, (int) n_win);
+                }
+            }
+            lctx.qsa_pooled_stale = false;
         }
 
         if (!direct) {
             GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_bias->buffer));
             float * dst_pool_bias = (float *) lctx.inp_kpool_bias->data;
-            // pool_bias[b, j] = 0 iff pool b is complete AND its last member (pos (b+1)*r - 1) is
-            // visible to query j (<= batch.pos[j]); else -inf (upstream pool_valid & pool_visible)
-            for (int64_t j = 0; j < n_tok && j < (int64_t) batch.n_tokens; ++j) {
-                const llama_pos q = batch.pos[j];
+            // pool_bias[b, j] = 0 iff pool b is complete AND one of query j's visible columns, else -inf
+            for (int64_t j = 0; j < n_tok; ++j) {
+                const int64_t lo = plan.vis_lo[j], hi = lo + plan.vis_n[j];
                 float * cur_bias = dst_pool_bias + j * n_pool;
                 for (int64_t b = 0; b < n_pool; ++b) {
-                    const bool ok = filled[b] == (int32_t) r && (llama_pos) ((b + 1) * r - 1) <= q;
-                    cur_bias[b] = ok ? 0.0f : -INFINITY;
+                    cur_bias[b] = ok[b] && b >= lo && b < hi ? 0.0f : -INFINITY;
                 }
             }
         } else {
-            // the same predicate split in two small vectors: pools are ordered by position, so the
-            // pools whose last member is <= q are exactly the first (q+1)/r of them
             GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_nvis->buffer));
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_lo->buffer));
             GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_ok->buffer));
             GGML_ASSERT(lctx.inp_kpool_ok->ne[0] == n_pool);
-            int32_t * dst_nvis = (int32_t *) lctx.inp_kpool_nvis->data;
-            int32_t * dst_ok   = (int32_t *) lctx.inp_kpool_ok->data;
+            std::copy(ok.begin(), ok.end(), (int32_t *) lctx.inp_kpool_ok->data);
+            std::copy(plan.vis_n.begin(),  plan.vis_n.end(),  (int32_t *) lctx.inp_kpool_nvis->data);
+            std::copy(plan.vis_lo.begin(), plan.vis_lo.end(), (int32_t *) lctx.inp_kpool_lo->data);
+        }
+        if (lctx.inp_kpool_row) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_row->buffer));
+            GGML_ASSERT(lctx.inp_kpool_row->ne[0] == n_pool);
+            int32_t * dst_row = (int32_t *) lctx.inp_kpool_row->data;
             for (int64_t b = 0; b < n_pool; ++b) {
-                dst_ok[b] = filled[b] == (int32_t) r ? 1 : 0;
-            }
-            for (int64_t j = 0; j < n_tok; ++j) {
-                const llama_pos q = j < (int64_t) batch.n_tokens ? batch.pos[j] : -1;
-                dst_nvis[j] = (int32_t) std::min<int64_t>(n_pool, (q + 1) / r);
+                dst_row[b] = std::max<int32_t>(0, plan.row[b]);   // an empty column reads any row: ok = 0 masks it
             }
         }
 
-        // tail_cells: the trailing incomplete pool [tail_start, q] for each query. A pickable
-        // pool ends at or before tail_start-1, so the tail never overlaps a selected pool.
-        // Masked layout: [r-1, n_tok], unused slots 0 (cell 0 is visible to every query).
-        // Direct layout: [n_tail, n_tok], unused slots -1 (no key); the rows beyond r-1 only pad
-        // the index list to a multiple of 256.
+        // tail_cells: the trailing incomplete pool [tail_start, q] of each query. A pickable pool ends at or
+        // before tail_start-1, so the tail never overlaps a selected pool.
+        // Masked layout: [r-1, n_tok], unused slots 0 (cell 0 is masked by the causal mask when not visible).
+        // Direct layout: [n_tail, n_tok], unused slots -1 (no key); the rows beyond r-1 only pad the index list
+        // to a multiple of 256.
         if (lctx.inp_kpool_tail) {
             GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_tail->buffer));
             int32_t * dst_tail = (int32_t *) lctx.inp_kpool_tail->data;
             const int64_t tail_w = lctx.inp_kpool_tail->ne[0];
             std::fill(dst_tail, dst_tail + tail_w * n_tok, direct ? -1 : 0);
-            for (int64_t j = 0; j < n_tok && j < (int64_t) batch.n_tokens; ++j) {
-                const llama_pos q = batch.pos[j];
-                const llama_pos tail_start = (q + 1) / (llama_pos) r * (llama_pos) r;
+            for (int64_t j = 0; j < n_tok; ++j) {
                 for (int64_t t = 0; t < r - 1 && t < tail_w; ++t) {
-                    const llama_pos p = tail_start + t;
-                    if (p <= q && p < (int64_t) cell_of_pos.size() && cell_of_pos[p] >= 0) {
-                        dst_tail[j * tail_w + t] = cell_of_pos[p];
+                    const int32_t c = plan.tail[j * (r - 1) + t];
+                    if (c >= 0) {
+                        dst_tail[j * tail_w + t] = c;
                     }
                 }
             }
-        }
-
-        // pooled-key cache window: pools are keyed by position, so the only pools whose members can
-        // have changed are the ones holding this ubatch's positions; the ubatch that completes a pool
-        // re-pools it. A short window repeats its last entry (the scatter writes the same value twice).
-        if (lctx.inp_kpool_win_pools) {
-            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_win_pools->buffer));
-            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_win_cells->buffer));
-            const int64_t n_win = lctx.inp_kpool_win_pools->ne[0];
-            int32_t * dst_win_pools = (int32_t *) lctx.inp_kpool_win_pools->data;
-            int32_t * dst_win_cells = (int32_t *) lctx.inp_kpool_win_cells->data;
-
-            std::vector<int32_t> touched;
-            if (lctx.qsa_pooled_stale) {
-                touched.resize(n_pool);
-                for (int64_t b = 0; b < n_pool; ++b) {
-                    touched[b] = (int32_t) b;
-                }
-            } else {
-                for (int64_t j = 0; j < (int64_t) batch.n_tokens; ++j) {
-                    const int64_t b = batch.pos[j] / r;
-                    if (b >= n_pool) continue;
-                    if (!touched.empty() && touched.back() == (int32_t) b) continue;
-                    if (std::find(touched.begin(), touched.end(), (int32_t) b) == touched.end()) {
-                        touched.push_back((int32_t) b);
-                    }
-                }
-            }
-            if (touched.empty()) {
-                touched.push_back(0);
-            }
-            for (int64_t w = 0; w < n_win; ++w) {
-                const int32_t b = touched[std::min<size_t>(w, touched.size() - 1)];
-                dst_win_pools[w] = b;
-                std::copy_n(dst_pool_cells + (int64_t) b * r, r, dst_win_cells + w * r);
-            }
-            // a pool this graph's window could not reach keeps an old key, so the next graph must
-            // pool every pool (only non-consecutive positions in one ubatch can do this)
-            lctx.qsa_pooled_stale = (int64_t) touched.size() > n_win;
         }
     }
 
@@ -7752,6 +7756,9 @@ static int llama_decode_internal(
 
             // must run before can_reuse_graph()
             llama_kv_cache_compact_swa(lctx, u_batch.n_tokens, cur_token == 0 ? n_tokens_all : 0);
+            if (lctx.model.arch == LLM_ARCH_GLM5NEXT && cparams.dsa && !kv_self.kr_l.empty()) {
+                llama_kpool_plan_update(lctx, u_batch);   // the pool tables' shapes gate graph reuse
+            }
             if (llm_arch_is_dsv4(lctx.model.arch) && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, false, false)) {
                 return GGML_STATUS_FAILED;
             }
@@ -7807,7 +7814,7 @@ static int llama_decode_internal(
                         cparams.mtp_op_type, lctx.mtp_step_idx, lctx.mtp_n_heads,
                         lctx.swa_window_view.w_view,
                         lctx.swa_window_view.win_off,
-                        seq_fingerprint, state_hash, gf});
+                        seq_fingerprint, state_hash, lctx.kpool_n_kv, lctx.kpool_n_pool, gf});
             }
         } else {
             //printf("Reusing graph with type = %d, n_kv = %d, n_tokens = %d\n", cparams.mtp_op_type, (int)prev->n_kv, (int)prev->n_tokens);
@@ -9558,22 +9565,18 @@ struct llama_context * llama_init_from_model(
     cparams.rope_cache       = params.rope_cache;
     cparams.graph_reuse      = params.graph_reuse;
     cparams.dsa              = params.dsa;
-    // glm5next (GLM-5.3-Flash) carries a KPool-DSA lightning indexer: sparse attention is on by default for a
-    // single sequence (the pool tables are per position, so sequences at the same positions would collide);
-    // LLAMA_DSA=0 forces dense, LLAMA_DSA=1 forces sparse. --dsa still forces it on.
+    // glm5next (GLM-5.3-Flash) carries a KPool-DSA lightning indexer: sparse attention is on by default (the pool
+    // tables are per sequence, see llama_kpool_plan_update); LLAMA_DSA=0 forces dense, LLAMA_DSA=1 forces sparse.
+    // --dsa still forces it on.
     if (model->arch == LLM_ARCH_GLM5NEXT && hparams.indexer_head_size > 0 && hparams.indexer_block_size > 0 &&
             hparams.indexer_top_k > 0) {
         if (const char * e = getenv("LLAMA_DSA")) {
             cparams.dsa = atoi(e) != 0;
-        } else if (!cparams.dsa) {
-            cparams.dsa = cparams.n_seq_max <= 1;
+        } else {
+            cparams.dsa = true;
         }
-        if (cparams.dsa && cparams.n_seq_max > 1) {
-            LLAMA_LOG_WARN("%s: glm5next DSA sparse attention is single-sequence only (n_seq_max = %u): pools of different sequences collide\n",
-                    __func__, cparams.n_seq_max);
-        }
-        LLAMA_LOG_INFO("%s: glm5next KPool-DSA sparse attention: %s (top_k %u, kpool %u, indexer heads %u; LLAMA_DSA=0|1 overrides)\n",
-                __func__, cparams.dsa ? "on" : "off", hparams.indexer_top_k, hparams.indexer_block_size, hparams.indexer_n_head);
+        LLAMA_LOG_INFO("%s: glm5next KPool-DSA sparse attention: %s (top_k %u, kpool %u, indexer heads %u, n_seq_max %u; LLAMA_DSA=0|1 overrides)\n",
+                __func__, cparams.dsa ? "on" : "off", hparams.indexer_top_k, hparams.indexer_block_size, hparams.indexer_n_head, cparams.n_seq_max);
     }
     cparams.fused_idx_topk   = params.fused_idx_topk;
     cparams.swa_compress     = params.swa_compress;

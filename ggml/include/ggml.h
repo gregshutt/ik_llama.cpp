@@ -2703,11 +2703,13 @@ extern "C" {
             enum ggml_unary_op    op,
             int                   n_top_k);
 
-    // Same scoring as ggml_indexer_topk, for pooled-key indexers whose visibility is a prefix per query:
-    // n_vis is I32 [T] with the number of leading k columns visible to query t (col < n_vis[t]) and
-    // col_ok (optional) is I32 [k->ne[1]] with 0 for columns that can never be picked. Columns that fail
-    // either test score -inf and sort last; output slot i of row t holds `sentinel` instead of a column
-    // id when the column it would name was not visible, so the caller can map it to an empty entry.
+    // Same scoring as ggml_indexer_topk, for pooled-key indexers whose visibility is one column range per query:
+    // query t sees the columns [lo, lo + n_vis[t]) with lo = vis_lo[t] (I32 [T]; 0 everywhere when vis_lo is NULL)
+    // and col_ok (optional) is I32 [n_cols] with 0 for columns that can never be picked. With col_row (optional,
+    // I32 [n_cols]) column c scores the k row col_row[c] (a negative row scores zero), so k may be a row-keyed
+    // cache of which only n_cols rows are live; without it the columns are the rows of k. Columns that fail a
+    // test score -inf and sort last; output slot i of row t holds `sentinel` instead of a column id when the
+    // column it would name was not visible, so the caller can map it to an empty entry.
     // CUDA only (k must be f16 or q8_0).
     GGML_API struct ggml_tensor * ggml_indexer_topk_nvis(
             struct ggml_context * ctx,
@@ -2716,6 +2718,8 @@ extern "C" {
             struct ggml_tensor  * w,
             struct ggml_tensor  * n_vis,
             struct ggml_tensor  * col_ok,
+            struct ggml_tensor  * vis_lo,
+            struct ggml_tensor  * col_row,
             enum ggml_unary_op    op,
             int                   n_top_k,
             int                   sentinel);

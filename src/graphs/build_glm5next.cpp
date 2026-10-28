@@ -66,10 +66,13 @@ struct glm5next_kpool_inputs {
     ggml_tensor * ape_slots = nullptr; // I32 [kpool]                 identity [0..kpool-1]
     ggml_tensor * nvis      = nullptr; // I32 [n_tokens]              direct path: leading pools visible to each query
     ggml_tensor * ok        = nullptr; // I32 [n_pool]                direct path: 1 if the pool is complete
+    ggml_tensor * lo        = nullptr; // I32 [n_tokens]              direct path: first column visible to each query (its sequence's pools)
+    ggml_tensor * row       = nullptr; // I32 [n_pool]                kp_l row of each column (the pools of every sequence)
     ggml_tensor * win_pools = nullptr; // I32 [n_win]                 kp_l window: pools re-pooled by this graph
     ggml_tensor * win_cells = nullptr; // I32 [kpool*n_win]
     bool    direct = false;            // maskless index-list selection (CUDA sparse kernels only)
     int64_t n_kv   = 0;                // cache view the pool tables cover (padded last used cell)
+    int64_t n_pool = 0;                // score columns: max(n_kv / kpool, the pools of every sequence)
     int64_t n_sel  = 0;                // pools picked per query
     int64_t n_idx  = 0;                // index-list length in direct mode (multiple of 256)
 };
@@ -112,24 +115,25 @@ static void glm5next_kpool_setup(llm_build_context & llm, glm5next_kpool_inputs 
     }
     const int64_t r        = hparams.indexer_block_size;
     const int64_t n_tokens = llm.n_tokens;
-    // this hybrid model keeps kv_self.n at the full cache size (llama_decode skips the used-cells
-    // heuristic for recurrent caches), so derive the DSA view from the last used cell: the pool
-    // tables, the indexer scoring and the K view then scale with the context in use, not with -c
-    int64_t n_kv = llm.n_kv;
+    // the pool tables follow this ubatch's plan (llama_kpool_plan_update): the K view covers the used cells
+    // (this hybrid model keeps kv_self.n at the full cache size, so the pool tables, the indexer scoring and
+    // the K view scale with the context in use, not with -c) and the columns are the pools of every sequence
+    int64_t n_kv   = llm.n_kv;
+    int64_t n_pool = n_kv / r;
     if (!llm.worst_case) {
-        uint32_t cell_max = 0;
-        for (uint32_t i = lctx.kv_self.size; i > 0; --i) {
-            const auto & c = lctx.kv_self.cells[i - 1];
-            if (c.pos >= 0 && !c.is_empty()) {
-                cell_max = i;
-                break;
-            }
+        auto & plan = lctx.kpool_plan;
+        if (!plan.valid || plan.kv_head != llm.kv_head || plan.n_tokens != n_tokens) {
+            llama_kpool_plan_update(lctx, llm.batch);
         }
-        n_kv = std::min<int64_t>(llm.n_kv, std::max<int64_t>(256, GGML_PAD((int64_t) cell_max, 256)));
+        GGML_ASSERT(plan.valid && "glm5next kpool: no pool plan for this ubatch");
+        GGML_ASSERT(plan.n_kv <= llm.n_kv);
+        n_kv   = plan.n_kv;
+        n_pool = plan.n_pool;
     }
-    kp.n_kv = n_kv;
-    lctx.kpool_n_kv = n_kv;
-    const int64_t n_pool   = n_kv / r;
+    kp.n_kv   = n_kv;
+    kp.n_pool = n_pool;
+    lctx.kpool_n_kv   = n_kv;
+    lctx.kpool_n_pool = n_pool;
     if (n_pool <= 0) {
         return;
     }
@@ -149,8 +153,10 @@ static void glm5next_kpool_setup(llm_build_context & llm, glm5next_kpool_inputs 
     static const bool dbg = getenv("LLAMA_DSA_DEBUG") != nullptr;
     const int mode = kp.direct ? 2 : 1;
     if (mode != last_mode || dbg) {
-        LLAMA_LOG_INFO("%s: glm5next DSA selection path: %s (n_kv %" PRId64 ", n_tokens %" PRId64 ", n_sel %" PRId64 ", n_idx %" PRId64 ")\n",
-                __func__, kp.direct ? "direct index list, no mask" : "masked", n_kv, n_tokens, kp.n_sel, kp.n_idx);
+        LLAMA_LOG_INFO("%s: glm5next DSA selection path: %s (n_kv %" PRId64 ", n_pool %" PRId64 " holding %" PRId64 " pools, n_tokens %" PRId64 ", n_sel %" PRId64 ", n_idx %" PRId64 ", re-pool %d)\n",
+                __func__, kp.direct ? "direct index list, no mask" : "masked", n_kv, n_pool,
+                llm.worst_case ? n_pool : lctx.kpool_plan.n_seq_pools, n_tokens, kp.n_sel, kp.n_idx,
+                llm.worst_case ? 0 : (int) lctx.kpool_plan.repool_rows.size());
         last_mode = mode;
     }
 
@@ -163,12 +169,15 @@ static void glm5next_kpool_setup(llm_build_context & llm, glm5next_kpool_inputs 
     cb(kp.ape_slots, "inp_kpool_ape",   -1);
     if (kp.direct) {
         kp.nvis = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        kp.lo   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         kp.ok   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
         kp.tail = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kp.n_idx - r * kp.n_sel, n_tokens);
         ggml_set_input(kp.nvis);
+        ggml_set_input(kp.lo);
         ggml_set_input(kp.ok);
         ggml_set_input(kp.tail);
         cb(kp.nvis, "inp_kpool_nvis", -1);
+        cb(kp.lo,   "inp_kpool_lo",   -1);
         cb(kp.ok,   "inp_kpool_ok",   -1);
         cb(kp.tail, "inp_kpool_tail", -1);
     } else {
@@ -182,15 +191,19 @@ static void glm5next_kpool_setup(llm_build_context & llm, glm5next_kpool_inputs 
         }
     }
     if (allow_direct && !lctx.kv_self.kp_l.empty()) {
-        // n_tokens consecutive positions span n_tokens/r pools, plus one when the run straddles a pool
-        // boundary; a stale cache (state restore, defrag) needs every pool
-        const int64_t n_win = lctx.qsa_pooled_stale ? n_pool : std::min<int64_t>(n_pool, (n_tokens + r - 1)/r + 1);
+        // a run of n consecutive positions spans n/r pools plus one when it straddles a pool boundary, and an
+        // ubatch holds at most one run per sequence; a stale cache (state restore, defrag) needs every pool
+        const int64_t n_win = lctx.qsa_pooled_stale ? n_pool
+            : std::min<int64_t>(n_pool, (n_tokens + r - 1)/r + std::max<int64_t>(1, lctx.cparams.n_seq_max) + 1);
         kp.win_pools = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_win);
         kp.win_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r * n_win);
+        kp.row       = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
         ggml_set_input(kp.win_pools);
         ggml_set_input(kp.win_cells);
+        ggml_set_input(kp.row);
         cb(kp.win_pools, "inp_kpool_win_pools", -1);
         cb(kp.win_cells, "inp_kpool_win_cells", -1);
+        cb(kp.row,       "inp_kpool_row",       -1);
     }
 
     lctx.kpool_direct        = kp.direct;
@@ -202,6 +215,8 @@ static void glm5next_kpool_setup(llm_build_context & llm, glm5next_kpool_inputs 
     lctx.inp_kpool_ok        = kp.ok;
     lctx.inp_kpool_win_pools = kp.win_pools;
     lctx.inp_kpool_win_cells = kp.win_cells;
+    lctx.inp_kpool_lo        = kp.lo;
+    lctx.inp_kpool_row       = kp.row;
 }
 
 // DSA k-pool indexer: writes this ubatch's indexer [key; gate] rows to kr_l, (re)pools the pools this
@@ -230,7 +245,7 @@ static ggml_tensor * build_glm5next_dsa_select(
     const int64_t r      = hparams.indexer_block_size;   // 4 (kpool)
     const int64_t n_kv   = kp.n_kv;                      // view covering the used cells (see glm5next_kpool_setup)
     const int64_t n_tok  = llm.n_tokens;
-    const int64_t n_pool = n_kv / r;
+    const int64_t n_pool = kp.n_pool;                    // the pools of every sequence (llama_kpool_plan_update)
 
     if (n_pool == 0) {
         return nullptr;
@@ -301,11 +316,18 @@ static ggml_tensor * build_glm5next_dsa_select(
     cb(pooled, "dsa_indexer_k_pooled", il);
 
     if (use_kp_cache) {
-        // score against the scatter's result, not the cache, so the read depends on the write
+        // score against the scatter's result, not the cache, so the read depends on the write. The rows are
+        // keyed by cell (llama_kpool_plan_update), so the columns are gathered through kp.row: inside the fused
+        // op on the direct path, with get_rows on the masked one
+        GGML_ASSERT(kp.row);
         auto kp_all = ggml_set_rows(ctx0, kp_cache, pooled, kp.win_pools);
         cb(kp_all, "dsa_indexer_k_scatter", il);
         ggml_build_forward_expand(gf, kp_all);   // the dense fallback below returns before scoring
-        pooled = ggml_view_2d(ctx0, kp_all, d, n_pool, ggml_row_size(kp_cache->type, d), 0);
+        if (kp.direct) {
+            pooled = ggml_view_2d(ctx0, kp_all, d, kp_cache->ne[1], ggml_row_size(kp_cache->type, d), 0);
+        } else {
+            pooled = ggml_get_rows(ctx0, kp_all, kp.row);                   // f32 [d, n_pool]
+        }
         cb(pooled, "dsa_indexer_k_cached", il);
     }
 
@@ -327,7 +349,7 @@ static ggml_tensor * build_glm5next_dsa_select(
     if (kp.direct) {
         // fused score + top-k over the visible pools: sorted by score, unfilled slots name the sentinel
         // pool (n_pool), whose cells are -1
-        auto sel = ggml_indexer_topk_nvis(ctx0, pooled, q, wts, kp.nvis, kp.ok, GGML_UNARY_OP_RELU,
+        auto sel = ggml_indexer_topk_nvis(ctx0, pooled, q, wts, kp.nvis, kp.ok, kp.lo, kp.row, GGML_UNARY_OP_RELU,
                 (int) n_sel, (int) n_pool);                            // [n_sel, n_tok]
         cb(sel, "dsa_top_k_pools", il);
 
