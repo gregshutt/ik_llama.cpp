@@ -1,7 +1,11 @@
 #include "common.cuh"
 #include "kda.cuh"
+#include "kda-chunked.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cmath>
+#include <vector>
 
 __device__ __forceinline__ float sigmoid_f(float x) {
     return 1.0f / (1.0f + expf(-x));
@@ -249,6 +253,67 @@ void ggml_cuda_op_kda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int32_t gqa_ratio = n_heads / n_heads_kq;
     const int32_t repeat_type = dst->op_params[0];
     const size_t output_size = (size_t) head_dim * n_tokens * n_heads * n_seqs;
+
+    // Chunked prefill (kda-chunked.cuh): batches of at least GGML_KDA_CHUNK_MIN tokens per sequence (default 64,
+    // 0 disables) run the parallel chunk formulation; decode and small batches keep the recurrent kernel.
+    static const int chunk_min = [] { const char * e = getenv("GGML_KDA_CHUNK_MIN"); return e ? atoi(e) : 64; }();
+    if (chunk_min > 0 && n_tokens >= chunk_min &&
+        kda_chunk::supported(head_dim, n_tokens, src6 ? (const float *) src6->data : nullptr, (const float *) src0->data, (const float *) src1->data,
+            (const float *) src2->data, src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float))) {
+        ggml_cuda_pool_alloc<float> scratch(ctx.pool(), kda_chunk::scratch_floats(n_heads, n_seqs));
+        // GGML_KDA_VERIFY=1 (diagnostic): also run the recurrent kernel on the same inputs and print the deviation per op
+        static const bool verify_env = getenv("GGML_KDA_VERIFY") != nullptr;
+        bool verify = verify_env;
+        if (verify) {   // the host-side comparison cannot run while a CUDA graph is being captured
+            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+            CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cap));
+            verify = cap == cudaStreamCaptureStatusNone;
+        }
+        const size_t state_size = (size_t) head_dim * head_dim * n_heads * n_seqs;
+        ggml_cuda_pool_alloc<float> ref;
+        if (verify) {
+            ref.alloc(ctx.pool(), output_size + state_size);
+            kda_f32_cuda(
+                (const float *)src0->data, (const float *)src1->data, (const float *)src2->data, (const float *)src3->data,
+                (const float *)src4->data, (const float *)src5->data, ref.get(), ref.get() + output_size, nullptr,
+                head_dim, n_tokens, n_heads, gqa_ratio, repeat_type, n_seqs,
+                src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float),
+                src3->nb[0]/sizeof(float), src3->nb[1]/sizeof(float), src3->nb[2]/sizeof(float), src3->nb[3]/sizeof(float),
+                src4->nb[1]/sizeof(float), src4->nb[2]/sizeof(float), src4->nb[3]/sizeof(float),
+                ctx.stream());
+        }
+        kda_chunk::launch(
+            (const float *)src0->data, (const float *)src1->data, (const float *)src2->data, (const float *)src3->data,
+            (const float *)src4->data, (const float *)src5->data,
+            (float *)dst->data, src7 ? (float *)src7->data : (float *)dst->data + output_size, scratch.get(),
+            n_tokens, n_heads, gqa_ratio, repeat_type, n_seqs,
+            src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float),
+            src3->nb[0]/sizeof(float), src3->nb[1]/sizeof(float), src3->nb[2]/sizeof(float), src3->nb[3]/sizeof(float),
+            src4->nb[1]/sizeof(float), src4->nb[2]/sizeof(float), src4->nb[3]/sizeof(float),
+            ctx.stream());
+        if (verify) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            std::vector<float> h_ref(output_size + state_size), h_out(output_size), h_st(state_size);
+            CUDA_CHECK(cudaMemcpy(h_ref.data(), ref.get(), h_ref.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_out.data(), dst->data, output_size * sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_st.data(), src7 ? (float *)src7->data : (float *)dst->data + output_size, state_size * sizeof(float), cudaMemcpyDeviceToHost));
+            auto stats = [](const float * a, const float * r, size_t n, double & max_err, double & max_ref, double & rms_rel) {
+                double se = 0, sr = 0; max_err = 0; max_ref = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const double e = fabs((double) a[i] - r[i]); if (e > max_err) max_err = e;
+                    if (fabs(r[i]) > max_ref) max_ref = fabs(r[i]);
+                    se += e * e; sr += (double) r[i] * r[i];
+                }
+                rms_rel = sr > 0 ? sqrt(se / sr) : 0.0;
+            };
+            double oe, orf, orr, se_, srf, srr;
+            stats(h_out.data(), h_ref.data(), output_size, oe, orf, orr);
+            stats(h_st.data(), h_ref.data() + output_size, state_size, se_, srf, srr);
+            fprintf(stderr, "[kda-verify] %s n_tokens %d: out max|err| %.3e max|ref| %.3e rel %.2e rms_rel %.2e | state max|err| %.3e max|ref| %.3e rel %.2e rms_rel %.2e\n",
+                    dst->name, n_tokens, oe, orf, orf > 0 ? oe / orf : 0.0, orr, se_, srf, srf > 0 ? se_ / srf : 0.0, srr);
+        }
+        return;
+    }
 
     kda_f32_cuda(
         (const float *)src0->data,
