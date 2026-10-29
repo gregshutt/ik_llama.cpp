@@ -200,8 +200,16 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     // p9: fused tensor-core score + radix top-k for the n_vis variant (GGML_DSA_INDEXER_FUSED=0 restores the
     // cuBLAS GEMM + read-back + cub segmented sort path below; GGML_DSA_INDEXER_TIMING=1 prints the phases)
     static const int  fused_env  = getenv("GGML_DSA_INDEXER_FUSED") ? atoi(getenv("GGML_DSA_INDEXER_FUSED")) : 1;
-    static const bool fused_time = getenv("GGML_DSA_INDEXER_TIMING") != nullptr;
+    static const bool fused_time_env = getenv("GGML_DSA_INDEXER_TIMING") != nullptr;
     static const bool fused_f16  = getenv("GGML_DSA_INDEXER_F16ACC") ? atoi(getenv("GGML_DSA_INDEXER_F16ACC")) != 0 : false;
+    bool fused_time = fused_time_env;
+    if (fused_time) {
+        // the phase timer synchronizes, which is not allowed while a CUDA graph is being captured: silently off
+        // there (use -cuda graphs=0 to see it)
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cs));
+        fused_time = cs == cudaStreamCaptureStatusNone;
+    }
     const ggml_tensor * vis_lo_t  = nvis_mode ? dst->src[6] : nullptr;   // optional I32 [T]: first visible column
     const ggml_tensor * col_row_t = nvis_mode ? dst->src[7] : nullptr;   // optional I32 [n_cols]: k row per column (per-sequence
                                                                          // pools), gathered into a compact key set below
