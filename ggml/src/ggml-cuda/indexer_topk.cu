@@ -3,6 +3,9 @@
 #include "quantize.cuh"
 #include "convert.cuh"
 #include "argsort.cuh"
+#include "indexer_select.cuh"
+
+#include <cstdlib>
 
 template <typename kq_t, typename mask_t>
 static __global__ void k_fused_relu_mul_sum_rows(const kq_t * __restrict__ kq, const float * __restrict__ w, const mask_t * __restrict__ m, float * __restrict__ dst, const int ncols, const int nhead, size_t nbm) {
@@ -172,6 +175,59 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     GGML_ASSERT(ggml_is_contiguous(w));
 
     constexpr int k_block_size = 256;
+
+    // p9: fused tensor-core score + radix top-k for the n_vis variant (GGML_DSA_INDEXER_FUSED=0 restores the
+    // cuBLAS GEMM + read-back + cub segmented sort path below; GGML_DSA_INDEXER_TIMING=1 prints the phases)
+    static const int  fused_env  = getenv("GGML_DSA_INDEXER_FUSED") ? atoi(getenv("GGML_DSA_INDEXER_FUSED")) : 1;
+    static const bool fused_time = getenv("GGML_DSA_INDEXER_TIMING") != nullptr;
+    static const bool fused_f16  = getenv("GGML_DSA_INDEXER_F16ACC") ? atoi(getenv("GGML_DSA_INDEXER_F16ACC")) != 0 : false;
+    const ggml_tensor * vis_lo_t  = nvis_mode ? dst->src[6] : nullptr;   // optional I32 [T]: first visible column
+    const ggml_tensor * col_row_t = nvis_mode ? dst->src[7] : nullptr;   // optional I32 [n_cols]: k row per column (per-sequence
+                                                                         // pools): not fused yet, the path below gathers
+    if (nvis_mode && fused_env != 0 && col_row_t == nullptr &&
+            dsa_idx::fused_supported((int) q->ne[0], (int) q->ne[1], n_top_k, ggml_cuda_info().devices[ctx.device].cc)) {
+        const int rows = (int) q->ne[2];
+        ggml_cuda_pool_alloc<half> q_f16(ctx.pool(), (size_t) q->ne[0]*q->ne[1]*rows);
+        ggml_cuda_pool_alloc<half> k_f16(ctx.pool());
+        const half * k_data = (const half *) k->data;
+        if (k->type == GGML_TYPE_Q8_0) {
+            k_f16.alloc((size_t) k->ne[0]*k->ne[1]);
+            auto to_fp16_k = ggml_get_to_fp16_cuda(k->type);
+            GGML_ASSERT(to_fp16_k);
+            to_fp16_k(k->data, k_f16.get(), k->ne[0]*k->ne[1], 1, ctx.stream());
+            CUDA_CHECK(cudaGetLastError());
+            k_data = k_f16.get();
+        }
+        cudaEvent_t ev[2];
+        if (fused_time) {
+            CUDA_CHECK(cudaEventCreate(&ev[0]));
+            CUDA_CHECK(cudaEventCreate(&ev[1]));
+            CUDA_CHECK(cudaEventRecord(ev[0], ctx.stream()));
+        }
+        auto to_fp16_q = ggml_get_to_fp16_cuda(q->type);
+        GGML_ASSERT(to_fp16_q);
+        to_fp16_q(q->data, q_f16.get(), q->ne[0]*q->ne[1]*rows, 1, ctx.stream());
+        CUDA_CHECK(cudaGetLastError());
+        const int rows_chunk = dsa_idx::rows_per_chunk(n_kv, rows, (size_t) 256 << 20);
+        ggml_cuda_pool_alloc<float> score(ctx.pool(), (size_t) n_kv*rows_chunk);
+        float ms_convert = 0.0f, ms_score = 0.0f, ms_select = 0.0f;
+        if (fused_time) {
+            CUDA_CHECK(cudaEventRecord(ev[1], ctx.stream()));
+            CUDA_CHECK(cudaEventSynchronize(ev[1]));
+            CUDA_CHECK(cudaEventElapsedTime(&ms_convert, ev[0], ev[1]));
+        }
+        dsa_idx::topk_fused(k_data, n_kv, q_f16.get(), (const float *) w->data, (const int *) m->data,
+                vis_lo_t ? (const int *) vis_lo_t->data : nullptr, col_ok ? (const int *) col_ok->data : nullptr,
+                (int *) dst->data, rows, n_top_k, sentinel, score.get(), rows_chunk, fused_f16, ctx.device, ctx.stream(),
+                fused_time ? &ms_score : nullptr, fused_time ? &ms_select : nullptr);
+        if (fused_time) {
+            printf("indexer_topk fused%s: n_pool %d rows %d k %d chunks %d: convert %.3f ms, score %.3f ms, select %.3f ms\n",
+                    fused_f16 ? " (f16 acc)" : "", n_kv, rows, n_top_k, (rows + rows_chunk - 1)/rows_chunk, ms_convert, ms_score, ms_select);
+            CUDA_CHECK(cudaEventDestroy(ev[0]));
+            CUDA_CHECK(cudaEventDestroy(ev[1]));
+        }
+        return;
+    }
 
     if ((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && q->type == GGML_TYPE_F32) {
         constexpr size_t k_max_buf_size = 1 << 28;

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <map>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -110,6 +111,7 @@ static const char * dump_dir    = getenv("EVAL_CB_DUMP_DIR");
 static const char * dump_filter = getenv("EVAL_CB_DUMP_FILTER");
 static const int    dump_cols   = getenv("EVAL_CB_DUMP_COLS") ? atoi(getenv("EVAL_CB_DUMP_COLS")) : 0;
 static const bool   quiet       = getenv("EVAL_CB_QUIET") != nullptr;
+static const bool   dump_seq    = getenv("EVAL_CB_DUMP_SEQ") != nullptr;   // name.<n>.bin per graph, not overwritten
 
 static bool dump_wanted(const struct ggml_tensor * t) {
     if (!dump_dir || ggml_is_quantized(t->type)) {
@@ -136,6 +138,10 @@ static void dump_tensor(const struct ggml_tensor * t, const uint8_t * data) {
     const int64_t nr  = ggml_nrows(t);
     const int64_t r0  = dump_cols > 0 && dump_cols < nr ? nr - dump_cols : 0;
     std::string path = std::string(dump_dir) + "/" + t->name + ".bin";
+    if (dump_seq) {
+        static std::map<std::string, int> seq;
+        path = std::string(dump_dir) + "/" + t->name + "." + std::to_string(seq[t->name]++) + ".bin";
+    }
     FILE * f = fopen(path.c_str(), "wb");
     if (!f) {
         fprintf(stderr, "dump: cannot open %s\n", path.c_str());
