@@ -204,8 +204,8 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     static const bool fused_f16  = getenv("GGML_DSA_INDEXER_F16ACC") ? atoi(getenv("GGML_DSA_INDEXER_F16ACC")) != 0 : false;
     const ggml_tensor * vis_lo_t  = nvis_mode ? dst->src[6] : nullptr;   // optional I32 [T]: first visible column
     const ggml_tensor * col_row_t = nvis_mode ? dst->src[7] : nullptr;   // optional I32 [n_cols]: k row per column (per-sequence
-                                                                         // pools): not fused yet, the path below gathers
-    if (nvis_mode && fused_env != 0 && col_row_t == nullptr &&
+                                                                         // pools), gathered into a compact key set below
+    if (nvis_mode && fused_env != 0 &&
             dsa_idx::fused_supported((int) q->ne[0], (int) q->ne[1], n_top_k, ggml_cuda_info().devices[ctx.device].cc)) {
         const int rows = (int) q->ne[2];
         ggml_cuda_pool_alloc<half> q_f16(ctx.pool(), (size_t) q->ne[0]*q->ne[1]*rows);
@@ -218,6 +218,16 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             to_fp16_k(k->data, k_f16.get(), k->ne[0]*k->ne[1], 1, ctx.stream());
             CUDA_CHECK(cudaGetLastError());
             k_data = k_f16.get();
+        }
+        ggml_cuda_pool_alloc<half> k_gath_f(ctx.pool());
+        if (col_row_t) {
+            // per-sequence pools (p9): column c is row col_row[c] of the row-keyed cache; the fused kernel takes the
+            // compact [ne0, n_cols] key set (n_kv = n_cols here)
+            k_gath_f.alloc((size_t) n_kv*k->ne[0]);
+            k_gather_rows_f16<<<n_kv, 128, 0, ctx.stream()>>>(k_data, (const int *) col_row_t->data, k_gath_f.get(),
+                    (int) k->ne[0], (int) k->ne[1]);
+            CUDA_CHECK(cudaGetLastError());
+            k_data = k_gath_f.get();
         }
         cudaEvent_t ev[2];
         if (fused_time) {

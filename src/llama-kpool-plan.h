@@ -92,7 +92,8 @@ int llama_kpool_plan_compute(llama_kpool_plan & plan, llama_kpool_rows & rows,
         seq_np[s] = seq_max[s] >= 0 ? (seq_max[s] + 1) / r : 0;
         n_seq_pools += seq_np[s];
     }
-    const int64_t n_pool = std::max<int64_t>(n_kv / r, n_seq_pools);
+    // padded to a multiple of 64 (n_kv / r already is): the fused indexer kernel works in 64-pool tiles
+    const int64_t n_pool = GGML_PAD(std::max<int64_t>(n_kv / r, n_seq_pools), 64);
 
     // member cells per (sequence, pool) slot; a sequence's trailing incomplete pool is kept for the tails
     plan.cells.assign(r * n_pool, -1);
