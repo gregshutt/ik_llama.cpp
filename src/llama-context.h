@@ -105,6 +105,9 @@ struct llama_kv_cache {
     uint32_t head = 0;
     uint32_t size = 0;
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
+    // no cell at or above this index is used: raised where cells become used (find_slot, whole-cache restore),
+    // lowered to the exact end by llama_kv_cache_cell_max(cache, pad)
+    uint32_t cell_end = 0;
 
     std::vector<uint32_t> row_count;
 

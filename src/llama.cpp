@@ -1889,6 +1889,7 @@ static bool llama_kv_cache_find_slot(
     }
 
     cache.used += n_tokens;
+    cache.cell_end = std::max(cache.cell_end, cache.head + n_tokens);
 
     return true;
 }
@@ -2051,22 +2052,23 @@ static uint32_t llama_kv_cache_cell_max(const struct llama_kv_cache & cache) {
     return 0;
 }
 
-static uint32_t llama_kv_cache_cell_max(const struct llama_kv_cache & cache, uint32_t pad) {
-    uint32_t last = cache.size;
-    for (uint32_t i = cache.size; i > 0; i -= pad) {
-        const llama_kv_cell & cell = cache.cells[i - 1];
-
+// The end of the used cells, without scanning the whole cache: cell_end bounds it from above, so the scan only
+// walks the cells freed since the last call. (Sampling one cell per pad block from the top, as this did before,
+// misses used cells above a block whose sampled cell is free: with several sequences the cells interleave and
+// seq_rm leaves such holes, so kv_self.n came out short, the attention lost those cells and the glm5next DSA
+// plan, which counts every cell, tripped GGML_ASSERT(plan.n_kv <= llm.n_kv).)
+static uint32_t llama_kv_cache_cell_max(struct llama_kv_cache & cache, uint32_t pad) {
+    GGML_UNUSED(pad);
+    uint32_t end = std::min(cache.cell_end, cache.size);
+    while (end > 0) {
+        const llama_kv_cell & cell = cache.cells[end - 1];
         if (cell.pos >= 0 && !cell.is_empty()) {
-            for (uint32_t j = last; j > i; --j) {
-                auto & cell_j = cache.cells[j - 1];
-                if (cell_j.pos >= 0 && !cell_j.is_empty()) return j;
-            }
-            return i;
+            break;
         }
-        last = i;
+        --end;
     }
-
-    return 0;
+    cache.cell_end = end;
+    return end;
 }
 
 bool llama_kv_cache::checkpoint_supported() const {
@@ -2280,6 +2282,7 @@ bool llama_kv_cache::checkpoint_restore(ggml_backend_sched_t sched, llama_ckpt_d
     cells = ckpt.cells_snapshot;
     head  = ckpt.head_snapshot;
     used  = ckpt.used_snapshot;
+    cell_end = size;   // the snapshot may use cells above the current bound; the next cell_max scans them
 
     std::unordered_set<ggml_backend_t> backends_to_sync;
     // a row with no resolvable backend is copied generically, outside any stream;
@@ -2658,6 +2661,7 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     }
     cache.head = 0;
     cache.used = 0;
+    cache.cell_end = 0;
     cache.cells_disordered = false;
     cache.head_swa     = cache.sink_rows;
     cache.pos_base_swa = 0;
@@ -2762,6 +2766,29 @@ static bool llama_kv_cache_seq_rm(
     }
 
     return true;
+}
+
+// Rewinds seq_id to the cells of a partial state: the sequence must hold exactly the positions `want` (any
+// order) at or below their maximum; the cells above go. Nothing moves, so the K/V rows of the kept cells stay
+// valid. Returns false (and changes nothing) when the cache no longer holds those positions for seq_id.
+static bool llama_kv_cache_seq_rewind(struct llama_kv_cache & cache, llama_seq_id seq_id, std::vector<llama_pos> & want) {
+    std::sort(want.begin(), want.end());
+    const llama_pos p_max = want.empty() ? -1 : want.back();
+    std::vector<llama_pos> have;
+    have.reserve(want.size());
+    for (uint32_t i = 0; i < cache.size; ++i) {
+        const llama_kv_cell & cell = cache.cells[i];
+        if (cell.pos >= 0 && cell.pos <= p_max && cell.has_seq_id(seq_id)) {
+            have.push_back(cell.pos);
+        }
+    }
+    std::sort(have.begin(), have.end());
+    if (have != want) {
+        LLAMA_LOG_ERROR("%s: sequence %d holds %zu cells at positions <= %d, the state expects %zu: not restoring it\n",
+                __func__, seq_id, have.size(), p_max, want.size());
+        return false;
+    }
+    return llama_kv_cache_seq_rm(cache, seq_id, p_max + 1, -1);
 }
 
 static void llama_kv_cache_seq_cp(
@@ -12048,7 +12075,8 @@ struct llama_data_read {
         }
     }
 
-    bool read_kv_cache_meta(struct llama_context * ctx, uint32_t cell_count, llama_seq_id dest_seq_id = -1) {
+    bool read_kv_cache_meta(struct llama_context * ctx, uint32_t cell_count, llama_seq_id dest_seq_id = -1,
+            llama_state_seq_flags flags = 0) {
         struct llama_kv_cache & kv_self = ctx->kv_self;
 
         if (dest_seq_id != -1) {
@@ -12062,6 +12090,26 @@ struct llama_data_read {
             if (cell_count > kv_self.size) {
                 LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
                 return false;
+            }
+
+            if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && !kv_self.any_compacted()) {
+                // a partial state (a context checkpoint) carries the recurrent state but not the K/V rows of these
+                // cells (nor the indexer keys): those rows are still in the cache, in the cells that hold this
+                // sequence now, so rewind the sequence there. Freeing it and finding a new slot (below) can move it
+                // onto other cells - with several sequences, onto the rows of one another slot has just freed - and
+                // the restored sequence then attends to that slot's old keys. (A compacted cache is single-sequence
+                // and its partial state carries the window rows, so it keeps the path below.)
+                std::vector<llama_pos> want(cell_count);
+                for (uint32_t i = 0; i < cell_count; ++i) {
+                    uint32_t n_seq_id;
+                    read_to(&want[i],  sizeof(llama_pos));
+                    read_to(&n_seq_id, sizeof(n_seq_id));
+                    if (n_seq_id != 0) {
+                        LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
+                        return false;
+                    }
+                }
+                return llama_kv_cache_seq_rewind(kv_self, dest_seq_id, want);
             }
 
             llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
@@ -12159,6 +12207,7 @@ struct llama_data_read {
 
             kv_self.head = 0;
             kv_self.used = cell_count;
+            kv_self.cell_end = cell_count;
         }
 
         return true;
@@ -12842,7 +12891,7 @@ struct llama_data_read {
         }
 
         // scalars before rows: they set the placement offset, and seq_rm inside meta resets head_swa
-        bool res = read_kv_cache_meta(ctx, cell_count, seq_id);
+        bool res = read_kv_cache_meta(ctx, cell_count, seq_id, flags);
         if (res && compact_blob) {
             kv_self.pos_base_swa = restore_pos_base;
             kv_self.head_swa     = restore_head_swa;
