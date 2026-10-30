@@ -5220,6 +5220,9 @@ static bool llm_load_tensors(
 
     model.mappings.reserve(ml.mappings.size());
 
+    // GGML_CUDA_SHARED_PINNED_WEIGHTS: the CPU-side weights of every process loading this model share one pinned segment
+    const bool use_shared_pinned = !dry_run && llama_shared_pinned_enabled(ml);
+
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_bufs;
     ctx_bufs.reserve(ctx_map.size());
@@ -5290,7 +5293,17 @@ static bool llm_load_tensors(
             for (auto t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
                 ++ntensor;
             }
-            if (ntensor > 0) {
+            bool placed = false;
+            if (ntensor > 0 && use_shared_pinned && buft == llama_default_buffer_type_cpu(true)) {
+                if (ggml_backend_buffer_t buf = llama_shared_pinned_alloc(ml, model, ctx, buft)) {
+                    model.bufs.push_back(buf);
+                    for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                        bufs.emplace(idx, buf);
+                    }
+                    placed = true;
+                }
+            }
+            if (ntensor > 0 && !placed) {
                 ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
                 if (buf == nullptr) {
                     LLAMA_LOG_ERROR("Failed to allocate buffer type %s\n", ggml_backend_buft_name(buft));
@@ -5428,6 +5441,7 @@ static bool llm_load_tensors(
             if (!ml.load_all_data(ctx, &model, bufs, use_mlock ? &model.mlock_mmaps : NULL, progress_callback, progress_callback_user_data)) {
                 return false;
             }
+            llama_shared_pinned_mark_ready(model, ctx); // this context's shared segment, if we created it, is complete
         }
 
         if (defer_expert_mmap) {

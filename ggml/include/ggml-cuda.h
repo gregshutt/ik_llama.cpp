@@ -39,6 +39,9 @@ GGML_API GGML_CALL void ggml_backend_cuda_get_device_description(int device, cha
 GGML_API GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
 GGML_API GGML_CALL bool ggml_backend_cuda_is_integrated(int device);
 
+// wraps a mapping the caller made (e.g. a MAP_SHARED tmpfs segment shared by several processes) in a pinned CUDA_Host
+// buffer: cudaHostRegister(Portable) now, cudaHostUnregister + munmap when the buffer is freed. NULL on failure.
+GGML_API GGML_CALL ggml_backend_buffer_t ggml_backend_cuda_host_buffer_from_ptr(void * ptr, size_t size);
 GGML_API GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 

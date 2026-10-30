@@ -1644,6 +1644,34 @@ GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_
     return buffer;
 }
 
+// A pinned CUDA_Host buffer over a mapping made by the caller (the loader's shared pinned weight segment, see
+// GGML_CUDA_SHARED_PINNED_WEIGHTS). The mapping must be PROT_WRITE: registering read-only needs cudaHostRegisterReadOnly,
+// which the GPUs here do not support. The buffer takes ownership of the mapping (free = unregister + munmap).
+GGML_CALL ggml_backend_buffer_t ggml_backend_cuda_host_buffer_from_ptr(void * ptr, size_t size) {
+#ifdef __linux__
+    auto tim1 = ggml_time_us();
+    cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable);
+    if (err != cudaSuccess) {
+        cudaGetLastError(); // clear the error
+        GGML_CUDA_LOG_WARN("%s: cudaHostRegister of %.2f MiB failed: %s\n", __func__,
+                           size/1024.0/1024.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+    GGML_CUDA_LOG_INFO("%s: registered %.2f GiB of shared host memory in %.1f ms\n", __func__,
+                       size/(1024.*1024.*1024.), 1e-3*(ggml_time_us() - tim1));
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = ggml_backend_cuda_host_buffer_type();
+    buffer->iface.get_name = ggml_backend_cuda_host_buffer_name;
+    buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+    return buffer;
+#else
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    return nullptr;
+#endif
+}
+
 GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host = {
         /* .iface    = */ {

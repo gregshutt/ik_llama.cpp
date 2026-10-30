@@ -1272,6 +1272,10 @@ bool llama_model_loader::load_all_data(
         GGML_ASSERT(weight != nullptr);
         GGML_ASSERT(weight->idx < files.size());
         const size_t n_size = ggml_nbytes(cur);
+        // a shared pinned segment filled by another process: nothing to read
+        if (cur->buffer != nullptr && std::find(preloaded_bufs.begin(), preloaded_bufs.end(), cur->buffer) != preloaded_bufs.end()) {
+            return n_size;
+        }
         const auto file = files.at(weight->idx)->clone();
 
         // mmap. Serialized.

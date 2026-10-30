@@ -14,6 +14,7 @@
 #include <set>
 
 #include "llama-reload-info.h"
+#include "llama-shared-pinned.h"
 
 // available llama models
 enum e_model {
@@ -653,6 +654,9 @@ struct llama_model {
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
+
+    // GGML_CUDA_SHARED_PINNED_WEIGHTS: tmpfs segments shared with other processes (the buffers over them are in bufs)
+    std::vector<std::unique_ptr<llama_shared_pinned_segment>> shared_segments;
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;

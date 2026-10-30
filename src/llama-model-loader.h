@@ -57,6 +57,8 @@ struct llama_model_loader {
     // Explicit --no-mmap with deferred tables: copy dense weights out, alias deferred only.
     bool defer_copy_dense = false;
     std::vector<ggml_backend_buffer_type_t> integrated_bufts;
+    // buffers whose data is already present (a shared pinned segment filled by another process): load_all_data skips them
+    std::vector<ggml_backend_buffer_t> preloaded_bufs;
 
     llama_files files;
     llama_ftype ftype;
