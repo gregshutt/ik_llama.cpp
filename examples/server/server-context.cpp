@@ -1938,23 +1938,28 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     }
 
     {
+        // build the new sampler before freeing the slot's current one: when the init throws (an output grammar that
+        // rejects the generation-prompt prefill) or fails, the slot keeps a valid sampler instead of a freed pointer
+        // that its next launch would free again (glibc "double free or corruption")
+        common_sampler * ctx_sampling_new = nullptr;
         try
         {
-            if (slot.ctx_sampling != nullptr) {
-                common_sampler_free(slot.ctx_sampling);
-            }
-            slot.ctx_sampling = common_sampler_init(model, slot.sparams);
+            ctx_sampling_new = common_sampler_init(model, slot.sparams);
         }
         catch (std::exception & e) {
             std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
             send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
             return false;
         }
-        if (slot.ctx_sampling == nullptr) {
+        if (ctx_sampling_new == nullptr) {
             // for now, the only error that may happen here is invalid grammar
             send_error(task, "Failed to parse grammar", ERROR_TYPE_INVALID_REQUEST);
             return false;
         }
+        if (slot.ctx_sampling != nullptr) {
+            common_sampler_free(slot.ctx_sampling);
+        }
+        slot.ctx_sampling = ctx_sampling_new;
     }
 
     do  // populate expiring logit bias
